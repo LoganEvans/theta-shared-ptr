@@ -1,6 +1,43 @@
 // FILENAME: include/theta/shared_ptr.hpp
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
+//
+// `theta::SharedPtr<T>` / `theta::WeakPtr<T>` / `theta::KeepAlive<T>`
+// ----------------------------------------------------------------------------
+// 100% binary `std::shared_ptr<T>` and `std::weak_ptr<T>` ABI-compatible
+// concurrent smart pointer powered by Linux `rseq` (`0 .. 8,191` CPUs).
+//
+// Memory & Virtual-Address Footprint Contract:
+//   1. Handle layout (`16 B`):
+//      `sizeof(theta::SharedPtr<T>) == 16` (`[T*, _Sp_counted_base*]`),
+//      untagged and binary-identical to libstdc++ `std::shared_ptr<T>`.
+//   2. Heap control block (`32 B` `ThetaSpCountedBase`):
+//      `make_shared<T>` allocates `32 B + sizeof(T)` in a single allocation
+//      (`+8 B` over `std::make_shared<T>`'s `24 B + sizeof(T)`; `40 B` -> same
+//      `48 B` glibc `malloc` bin for 8-byte types).
+//   3. Uncopied / sole-owner pointers (`0 B` extra RSS):
+//      Pointers that are only moved or never copied stay in `kModeUnpromoted`,
+//      allocate `0` per-CPU slots, touch `0` slab/metadata pages, and destroy
+//      with `0` atomic RMWs and `0` virtual calls.
+//   4. Promoted (copied) pointers & `KeepAlive<T>` (`MAP_NORESERVE` slabs):
+//      - Virtual address reservation (uncommitted, `0 B` physical RAM until
+//        faulted): `131,072` slots * `8,192` CPUs * `8 B` = `8 GiB` slab VA
+//        (`256 MiB` under ASan/TSan) + `8 MiB` slot-metadata VA + `1 MiB`
+//        `KeepAlive` table VA.
+//      - Cold-start RSS (first promoted pointer in process): slabs are indexed
+//        as `(cpu << 17) + slot_id`, packing `512` consecutive `slot_id`s onto
+//        one `4 KiB` page per CPU. The first promoted pointer faults `1 * 4
+//        KiB` metadata page + `1 * 4 KiB` slab page per CPU that actually
+//        copies it (e.g., `~52 KiB` across 12 CPUs; `0 B` on untouched CPUs
+//        `12..8191`).
+//      - Marginal RSS (pointers `#2..#511`, and recycled slots):
+//        `64 B` (`PerCpuSlotMeta`) + `8 B * active_cpus` per concurrently live
+//        promoted control block (e.g., `160 B`/ptr across 12 CPUs, `576 B`/ptr
+//        across 64 CPUs). Recycled `slot_id`s reuse already-faulted pages via
+//        `initial-exec` thread-local caches.
+//      - Graceful saturation: up to `131,072` concurrently promoted objects use
+//        `rseq` slabs; excess promotions transparently fall back to atomic
+//        `_Sp_counted_base` reference counting (`0` allocation failures).
 
 #pragma once
 
