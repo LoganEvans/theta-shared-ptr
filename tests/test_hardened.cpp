@@ -4,14 +4,14 @@
 //
 // 5 kHz `SIGPROF` preemption-storm stress test continuously interrupting
 // oversubscribed threads inside `rseq` critical sections (`SharedPtr` +
-// `KeepAlive`) and per-CPU atomic shards (`HyperSharedPtr`).
+// `KeepAlive`).
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <csignal>
 #include <cstdint>
-#include <theta/hyper_shared_ptr.hpp>
+#include <theta/shared_ptr.hpp>
 #include <thread>
 #include <vector>
 
@@ -69,8 +69,7 @@ TEST(HardenedPreemptionStormTest, RseqAbortAndKeepAliveUnder5kHzSignals) {
 
   {
     KeepAlive<StormPayload> ka(make_shared<StormPayload>(1));
-    auto hot_abi = make_shared<StormPayload>(777);
-    auto hot_hsp = make_hyper_shared<StormPayload>(888);
+    auto hot_sp = make_shared<StormPayload>(777);
 
     std::atomic<bool> stop{false};
     constexpr int kWorkers = 12;
@@ -85,10 +84,11 @@ TEST(HardenedPreemptionStormTest, RseqAbortAndKeepAliveUnder5kHzSignals) {
             if (s1) {
               ASSERT_EQ(s1->cookie, 0xA5A55A5AF00DFACEULL);
             }
-            auto s2 = hot_abi;
+            auto s2 = hot_sp;
             ASSERT_EQ(s2->epoch, 777);
-            auto s3 = hot_hsp;
-            ASSERT_EQ(s3->epoch, 888);
+          }
+          if constexpr (arch::kTsanEnabled) {
+            std::this_thread::yield();
           }
         }
       });

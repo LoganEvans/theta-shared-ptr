@@ -1,16 +1,16 @@
-// FILENAME: include/theta/hyper_shared_ptr/detail/backend_aarch64.hpp
+// FILENAME: include/theta/shared_ptr/detail/backend_aarch64.hpp
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
 #pragma once
 
-#include <theta/hyper_shared_ptr/detail/common.hpp>
+#include <theta/shared_ptr/detail/common.hpp>
 
-#if THETA_ARCH_AARCH64 && THETA_HSP_USE_RSEQ_ASM
+#if THETA_ARCH_AARCH64 && THETA_SHARED_PTR_USE_RSEQ_ASM
 
 #include <sys/rseq.h>
 
-namespace theta::hyper_shared_ptr::detail {
+namespace theta::detail::shared_ptr {
 
 static_assert(offsetof(struct rseq, cpu_id) == 4,
               "Linux struct rseq::cpu_id must reside at byte offset 4.");
@@ -23,14 +23,6 @@ static_assert(
 #endif
 
 struct ArchBackend {
-  static THETA_FORCE_INLINE std::int32_t fast_cpu_id() noexcept {
-    const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
-    const auto* rseq_base = tp + __rseq_offset;
-    const auto* cpu_ptr = reinterpret_cast<const std::int32_t*>(rseq_base + 4);
-    const std::int32_t c = __atomic_load_n(cpu_ptr, __ATOMIC_RELAXED);
-    return (c >= 0 && c < kHspMaxCpus) ? c : current_cpu_id();
-  }
-
   static THETA_FORCE_INLINE bool try_rseq_inc(SpFastHeader* fast) noexcept {
     const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
     const char* const rseq_base = tp + __rseq_offset;
@@ -247,6 +239,6 @@ struct ArchBackend {
   }
 };
 
-}  // namespace theta::hyper_shared_ptr::detail
+}  // namespace theta::detail::shared_ptr
 
-#endif  // THETA_ARCH_AARCH64 && THETA_HSP_USE_RSEQ_ASM
+#endif  // THETA_ARCH_AARCH64 && THETA_SHARED_PTR_USE_RSEQ_ASM

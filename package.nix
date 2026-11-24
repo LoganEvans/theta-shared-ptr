@@ -11,7 +11,7 @@
 }:
 llvmPackages_23.stdenv.mkDerivation {
   inherit src;
-  pname = "theta-hyper-shared-ptr";
+  pname = "theta-shared-ptr";
   version = "0.2.0";
 
   outputs = [ "out" ];

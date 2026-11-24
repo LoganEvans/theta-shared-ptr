@@ -1,11 +1,10 @@
-// FILENAME: benchmarks/bench_hyper_shared_ptr.cpp
+// FILENAME: benchmarks/bench_shared_ptr.cpp
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
 //
-// 3-way microarchitectural comparison across:
+// Head-to-head microarchitectural benchmark suite comparing:
 //   (a) `StdSharedPtr`   — stock `std::shared_ptr<T>` (`LOCK XADD` on 1 line)
-//   (b) `HyperSharedPtr` — 8192-CPU handle-tagged per-CPU atomic shards
-//   (c) `ThetaSharedPtr` — 100% `std::shared_ptr` ABI-compatible `rseq`
+//   (b) `ThetaSharedPtr` — 100% `std::shared_ptr` ABI-compatible `rseq`
 //                          8192-CPU striped per-CPU delta reference counter
 
 #include <benchmark/benchmark.h>
@@ -18,7 +17,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <theta/arch.hpp>
-#include <theta/hyper_shared_ptr.hpp>
+#include <theta/shared_ptr.hpp>
 #include <thread>
 #include <vector>
 
@@ -60,7 +59,7 @@ void apply_pair_sweep(benchmark::Benchmark* b) {
 }
 
 // ============================================================================
-// 01. Unshared Creation + Destruction (`make_*_shared` + ~Ptr)
+// 01. Unshared Creation + Destruction (`make_shared` + ~SharedPtr)
 // ============================================================================
 void BM_01a_CreateDestroy_StdSharedPtr(benchmark::State& state) {
   for (auto _ : state) {
@@ -70,21 +69,13 @@ void BM_01a_CreateDestroy_StdSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_01a_CreateDestroy_StdSharedPtr)->Apply(apply_thread_sweep);
 
-void BM_01b_CreateDestroy_HyperSharedPtr(benchmark::State& state) {
-  for (auto _ : state) {
-    auto p = theta::make_hyper_shared<std::uint64_t>(42ULL);
-    benchmark::DoNotOptimize(p);
-  }
-}
-BENCHMARK(BM_01b_CreateDestroy_HyperSharedPtr)->Apply(apply_thread_sweep);
-
-void BM_01c_CreateDestroy_ThetaSharedPtr(benchmark::State& state) {
+void BM_01b_CreateDestroy_ThetaSharedPtr(benchmark::State& state) {
   for (auto _ : state) {
     auto p = theta::make_shared<std::uint64_t>(42ULL);
     benchmark::DoNotOptimize(p);
   }
 }
-BENCHMARK(BM_01c_CreateDestroy_ThetaSharedPtr)->Apply(apply_thread_sweep);
+BENCHMARK(BM_01b_CreateDestroy_ThetaSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 02. Hot Sharing (`0 -> 1 -> 0` Single Temporary Copy Loop — Real-World
@@ -100,17 +91,7 @@ void BM_02a_HotShare0to1_StdSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_02a_HotShare0to1_StdSharedPtr)->Apply(apply_thread_sweep);
 
-void BM_02b_HotShare0to1_HyperSharedPtr(benchmark::State& state) {
-  static const auto* g_ptr = new theta::HyperSharedPtr<std::uint64_t>(
-      theta::make_hyper_shared<std::uint64_t>(7ULL));
-  for (auto _ : state) {
-    theta::HyperSharedPtr<std::uint64_t> local = *g_ptr;
-    benchmark::DoNotOptimize(local);
-  }
-}
-BENCHMARK(BM_02b_HotShare0to1_HyperSharedPtr)->Apply(apply_thread_sweep);
-
-void BM_02c_HotShare0to1_ThetaSharedPtr(benchmark::State& state) {
+void BM_02b_HotShare0to1_ThetaSharedPtr(benchmark::State& state) {
   static const auto* g_ptr = new theta::SharedPtr<std::uint64_t>(
       theta::make_shared<std::uint64_t>(7ULL));
   for (auto _ : state) {
@@ -118,11 +99,10 @@ void BM_02c_HotShare0to1_ThetaSharedPtr(benchmark::State& state) {
     benchmark::DoNotOptimize(local);
   }
 }
-BENCHMARK(BM_02c_HotShare0to1_ThetaSharedPtr)->Apply(apply_thread_sweep);
+BENCHMARK(BM_02b_HotShare0to1_ThetaSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
-// 03. Pinned Hot Sharing (`1 -> 2 -> 1`, Matching Original README Regime
-//     Without `uniform_int_distribution` PRNG Overhead)
+// 03. Pinned Hot Sharing (`1 -> 2 -> 1`)
 // ============================================================================
 void BM_03a_HotSharePinned_StdSharedPtr(benchmark::State& state) {
   static const auto* g_ptr =
@@ -136,19 +116,7 @@ void BM_03a_HotSharePinned_StdSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_03a_HotSharePinned_StdSharedPtr)->Apply(apply_thread_sweep);
 
-void BM_03b_HotSharePinned_HyperSharedPtr(benchmark::State& state) {
-  static const auto* g_ptr = new theta::HyperSharedPtr<std::uint64_t>(
-      theta::make_hyper_shared<std::uint64_t>(9ULL));
-  theta::HyperSharedPtr<std::uint64_t> pinned = *g_ptr;
-  benchmark::DoNotOptimize(pinned);
-  for (auto _ : state) {
-    theta::HyperSharedPtr<std::uint64_t> local = *g_ptr;
-    benchmark::DoNotOptimize(local);
-  }
-}
-BENCHMARK(BM_03b_HotSharePinned_HyperSharedPtr)->Apply(apply_thread_sweep);
-
-void BM_03c_HotSharePinned_ThetaSharedPtr(benchmark::State& state) {
+void BM_03b_HotSharePinned_ThetaSharedPtr(benchmark::State& state) {
   static const auto* g_ptr = new theta::SharedPtr<std::uint64_t>(
       theta::make_shared<std::uint64_t>(9ULL));
   theta::SharedPtr<std::uint64_t> pinned = *g_ptr;
@@ -158,7 +126,7 @@ void BM_03c_HotSharePinned_ThetaSharedPtr(benchmark::State& state) {
     benchmark::DoNotOptimize(local);
   }
 }
-BENCHMARK(BM_03c_HotSharePinned_ThetaSharedPtr)->Apply(apply_thread_sweep);
+BENCHMARK(BM_03b_HotSharePinned_ThetaSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 04. Cross-Thread Producer -> Consumer Handoff (Batched Ring Slots)
@@ -178,7 +146,6 @@ void run_prod_cons_bench(benchmark::State& state, const PtrType& proto) {
   auto& ring = rings[static_cast<std::size_t>(pair_id) & 127U];
 
   if (state.thread_index() % 2 == 0) {
-    // Producer copies `proto` and hands off to sibling consumer thread
     for (auto _ : state) {
       std::uint64_t t = ring.tail.load(std::memory_order_relaxed);
       while (t - ring.head.load(std::memory_order_acquire) >=
@@ -188,13 +155,11 @@ void run_prod_cons_bench(benchmark::State& state, const PtrType& proto) {
       ring.slots[t & (SpscRing<PtrType>::kCap - 1U)] = proto;
       ring.tail.store(t + 1ULL, std::memory_order_release);
     }
-    // Drain leftovers at end of run so next thread-count run starts clean
     while (ring.head.load(std::memory_order_acquire) !=
            ring.tail.load(std::memory_order_relaxed)) {
       theta::arch::cpu_relax();
     }
   } else {
-    // Consumer pops and destroys handle on a different thread/CPU
     for (auto _ : state) {
       std::uint64_t h = ring.head.load(std::memory_order_relaxed);
       while (ring.tail.load(std::memory_order_acquire) == h) {
@@ -214,19 +179,12 @@ void BM_04a_CrossThreadProdCons_StdSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_04a_CrossThreadProdCons_StdSharedPtr)->Apply(apply_pair_sweep);
 
-void BM_04b_CrossThreadProdCons_HyperSharedPtr(benchmark::State& state) {
-  static const auto* g_ptr = new theta::HyperSharedPtr<std::uint64_t>(
-      theta::make_hyper_shared<std::uint64_t>(11ULL));
-  run_prod_cons_bench(state, *g_ptr);
-}
-BENCHMARK(BM_04b_CrossThreadProdCons_HyperSharedPtr)->Apply(apply_pair_sweep);
-
-void BM_04c_CrossThreadProdCons_ThetaSharedPtr(benchmark::State& state) {
+void BM_04b_CrossThreadProdCons_ThetaSharedPtr(benchmark::State& state) {
   static const auto* g_ptr = new theta::SharedPtr<std::uint64_t>(
       theta::make_shared<std::uint64_t>(11ULL));
   run_prod_cons_bench(state, *g_ptr);
 }
-BENCHMARK(BM_04c_CrossThreadProdCons_ThetaSharedPtr)->Apply(apply_pair_sweep);
+BENCHMARK(BM_04b_CrossThreadProdCons_ThetaSharedPtr)->Apply(apply_pair_sweep);
 
 // ============================================================================
 // 05. Read-Mostly Config Snapshot (`KeepAlive::get()` — 99.99% Readers,
@@ -268,23 +226,7 @@ void BM_05a_KeepAliveSnapshot_StdSharedMutex(benchmark::State& state) {
 }
 BENCHMARK(BM_05a_KeepAliveSnapshot_StdSharedMutex)->Apply(apply_thread_sweep);
 
-void BM_05b_KeepAliveSnapshot_HyperKeepAlive(benchmark::State& state) {
-  static auto* g_ka =
-      new theta::HyperKeepAlive<std::uint64_t>(new std::uint64_t(1ULL));
-  std::uint64_t iter = 0;
-  for (auto _ : state) {
-    if (state.thread_index() == 0 && ((++iter & 16383ULL) == 0ULL))
-        [[unlikely]] {
-      (void)g_ka->reset(new std::uint64_t(iter));
-    } else {
-      auto snap = g_ka->get();
-      benchmark::DoNotOptimize(*snap);
-    }
-  }
-}
-BENCHMARK(BM_05b_KeepAliveSnapshot_HyperKeepAlive)->Apply(apply_thread_sweep);
-
-void BM_05c_KeepAliveSnapshot_ThetaKeepAlive(benchmark::State& state) {
+void BM_05b_KeepAliveSnapshot_ThetaKeepAlive(benchmark::State& state) {
   static auto* g_ka = new theta::KeepAlive<std::uint64_t>(
       theta::make_shared<std::uint64_t>(1ULL));
   std::uint64_t iter = 0;
@@ -298,7 +240,7 @@ void BM_05c_KeepAliveSnapshot_ThetaKeepAlive(benchmark::State& state) {
     }
   }
 }
-BENCHMARK(BM_05c_KeepAliveSnapshot_ThetaKeepAlive)->Apply(apply_thread_sweep);
+BENCHMARK(BM_05b_KeepAliveSnapshot_ThetaKeepAlive)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 06. 2,048-Object Working-Set Table (Cache Footprint & Striped Page Packing)
@@ -313,34 +255,17 @@ void BM_06a_Table2K_StdSharedPtr(benchmark::State& state) {
     }
     return v;
   }();
-  std::size_t idx = static_cast<std::size_t>(state.thread_index()) * 131U;
+  std::uint64_t idx =
+      static_cast<std::uint64_t>(state.thread_index()) * 2654435761ULL;
   for (auto _ : state) {
-    idx = (idx + 1U) & (kTableSize - 1U);
-    auto local = (*g_tbl)[idx];
-    benchmark::DoNotOptimize(*local);
+    idx = (idx + 17ULL) & (kTableSize - 1U);
+    auto cp = (*g_tbl)[idx];
+    benchmark::DoNotOptimize(cp);
   }
 }
 BENCHMARK(BM_06a_Table2K_StdSharedPtr)->Apply(apply_thread_sweep);
 
-void BM_06b_Table2K_HyperSharedPtr(benchmark::State& state) {
-  static const auto* g_tbl = []() {
-    auto* v =
-        new std::array<theta::HyperSharedPtr<std::uint64_t>, kTableSize>();
-    for (std::size_t i = 0; i < kTableSize; ++i) {
-      (*v)[i] = theta::make_hyper_shared<std::uint64_t>(i);
-    }
-    return v;
-  }();
-  std::size_t idx = static_cast<std::size_t>(state.thread_index()) * 131U;
-  for (auto _ : state) {
-    idx = (idx + 1U) & (kTableSize - 1U);
-    auto local = (*g_tbl)[idx];
-    benchmark::DoNotOptimize(*local);
-  }
-}
-BENCHMARK(BM_06b_Table2K_HyperSharedPtr)->Apply(apply_thread_sweep);
-
-void BM_06c_Table2K_ThetaSharedPtr(benchmark::State& state) {
+void BM_06b_Table2K_ThetaSharedPtr(benchmark::State& state) {
   static const auto* g_tbl = []() {
     auto* v = new std::array<theta::SharedPtr<std::uint64_t>, kTableSize>();
     for (std::size_t i = 0; i < kTableSize; ++i) {
@@ -348,14 +273,15 @@ void BM_06c_Table2K_ThetaSharedPtr(benchmark::State& state) {
     }
     return v;
   }();
-  std::size_t idx = static_cast<std::size_t>(state.thread_index()) * 131U;
+  std::uint64_t idx =
+      static_cast<std::uint64_t>(state.thread_index()) * 2654435761ULL;
   for (auto _ : state) {
-    idx = (idx + 1U) & (kTableSize - 1U);
-    auto local = (*g_tbl)[idx];
-    benchmark::DoNotOptimize(*local);
+    idx = (idx + 17ULL) & (kTableSize - 1U);
+    auto cp = (*g_tbl)[idx];
+    benchmark::DoNotOptimize(cp);
   }
 }
-BENCHMARK(BM_06c_Table2K_ThetaSharedPtr)->Apply(apply_thread_sweep);
+BENCHMARK(BM_06b_Table2K_ThetaSharedPtr)->Apply(apply_thread_sweep);
 
 }  // namespace
 

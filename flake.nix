@@ -1,6 +1,6 @@
 # FILENAME: flake.nix
 {
-  description = "theta-hyper-shared-ptr: 8192-CPU rseq std::shared_ptr ABI-compatible and handle-tagged concurrent smart pointers";
+  description = "theta-shared-ptr: 8192-CPU rseq std::shared_ptr ABI-compatible concurrent smart pointer and KeepAlive";
 
   inputs = {
     theta-utils.url = "github:LoganEvans/theta-utils";
@@ -17,7 +17,7 @@
     }:
     theta-utils.lib.mkThetaFlake {
       inherit self;
-      pname = "theta-hyper-shared-ptr";
+      pname = "theta-shared-ptr";
       packageFn = ./package.nix;
       treefmtModule = ./treefmt.nix;
     };

@@ -1,23 +1,19 @@
-// FILENAME: include/theta/hyper_shared_ptr/detail/backend_fallback.hpp
+// FILENAME: include/theta/shared_ptr/detail/backend_fallback.hpp
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
 #pragma once
 
-#include <theta/hyper_shared_ptr/detail/common.hpp>
+#include <theta/shared_ptr/detail/common.hpp>
 
-#if !THETA_HSP_USE_RSEQ_ASM
+#if !THETA_SHARED_PTR_USE_RSEQ_ASM
 
-namespace theta::hyper_shared_ptr::detail {
+namespace theta::detail::shared_ptr {
 
 // Portable C++23 / ThreadSanitizer backend exercising the exact same promotion,
-// per-CPU striped slab registration, `central_tickets_`, and harvest state
+// per-CPU striped slab registration, `central_tickets`, and harvest state
 // machine via instrumented atomics when `rseq` inline `asm` is disabled.
 struct ArchBackend {
-  static THETA_FORCE_INLINE std::int32_t fast_cpu_id() noexcept {
-    return current_cpu_id();
-  }
-
   static THETA_FORCE_INLINE bool try_rseq_inc(SpFastHeader* fast) noexcept {
     if (__atomic_load_n(&fast->fast_active, __ATOMIC_ACQUIRE) == 0U) {
       return false;
@@ -105,6 +101,6 @@ struct ArchBackend {
   }
 };
 
-}  // namespace theta::hyper_shared_ptr::detail
+}  // namespace theta::detail::shared_ptr
 
-#endif  // !THETA_HSP_USE_RSEQ_ASM
+#endif  // !THETA_SHARED_PTR_USE_RSEQ_ASM

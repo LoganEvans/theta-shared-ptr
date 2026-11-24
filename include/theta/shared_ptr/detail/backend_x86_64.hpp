@@ -1,16 +1,16 @@
-// FILENAME: include/theta/hyper_shared_ptr/detail/backend_x86_64.hpp
+// FILENAME: include/theta/shared_ptr/detail/backend_x86_64.hpp
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
 #pragma once
 
-#include <theta/hyper_shared_ptr/detail/common.hpp>
+#include <theta/shared_ptr/detail/common.hpp>
 
-#if THETA_ARCH_X86_64 && THETA_HSP_USE_RSEQ_ASM
+#if THETA_ARCH_X86_64 && THETA_SHARED_PTR_USE_RSEQ_ASM
 
 #include <sys/rseq.h>
 
-namespace theta::hyper_shared_ptr::detail {
+namespace theta::detail::shared_ptr {
 
 static_assert(offsetof(struct rseq, cpu_id) == 4,
               "Linux struct rseq::cpu_id must reside at byte offset 4.");
@@ -23,15 +23,6 @@ static_assert(
 #endif
 
 struct ArchBackend {
-  static THETA_FORCE_INLINE std::int32_t fast_cpu_id() noexcept {
-    const std::ptrdiff_t rseq_off = __rseq_offset;
-    const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
-    const auto* cpu_ptr =
-        reinterpret_cast<const std::int32_t*>(tp + rseq_off + 4);
-    const std::int32_t c = __atomic_load_n(cpu_ptr, __ATOMIC_RELAXED);
-    return (c >= 0 && c < kHspMaxCpus) ? c : current_cpu_id();
-  }
-
   // Zero-atomic, zero-fence per-CPU `rseq` reference increment (`val >= 1` ->
   // `val + 1`, keeping width-matched 8-byte load/store for 4-cycle STLF).
   static THETA_FORCE_INLINE bool try_rseq_inc(SpFastHeader* fast) noexcept {
@@ -78,7 +69,7 @@ struct ArchBackend {
         ".popsection\n\t"
         : [idx] "=&r"(idx), [slot] "=&r"(slot), [val] "=&r"(val)
         : [rseq_off] "r"(rseq_off), [fast] "r"(fast), [base] "r"(base),
-          [max_cpus] "i"(kHspMaxCpus), [shift] "i"(kSlotShift)
+          [max_cpus] "i"(kSharedPtrMaxCpus), [shift] "i"(kSlotShift)
         : "memory", "cc"
         : slow_inc);
     return true;
@@ -129,7 +120,7 @@ struct ArchBackend {
         ".popsection\n\t"
         : [idx] "=&r"(idx), [slot] "=&r"(slot), [val] "=&r"(val)
         : [rseq_off] "r"(rseq_off), [fast] "r"(fast), [base] "r"(base),
-          [max_cpus] "i"(kHspMaxCpus), [shift] "i"(kSlotShift)
+          [max_cpus] "i"(kSharedPtrMaxCpus), [shift] "i"(kSlotShift)
         : "memory", "cc"
         : slow_dec);
     return true;
@@ -191,7 +182,7 @@ struct ArchBackend {
         ".popsection\n\t"
         : [cb] "=&r"(cb), [idx] "=&r"(idx), [slot] "=&r"(slot), [val] "=&r"(val)
         : [rseq_off] "r"(rseq_off), [cb_slot] "r"(cb_slot), [base] "r"(base),
-          [max_cpus] "i"(kHspMaxCpus), [shift] "i"(kSlotShift)
+          [max_cpus] "i"(kSharedPtrMaxCpus), [shift] "i"(kSlotShift)
         : "memory", "cc"
         : null_done, slow_ka);
     out_cb = cb;
@@ -206,7 +197,7 @@ struct ArchBackend {
   }
 
   // Drains accumulated producer surplus (`val >= 2` -> `1`) on the current CPU
-  // inside `rseq` while caller holds `cb->reg_lock_` (`0` `SYS_membarrier`!).
+  // inside `rseq` while caller holds `cb->fast_.reg_lock` (`0` `membarrier`!).
   static THETA_FORCE_INLINE bool try_rseq_drain_local_surplus(
       SpFastHeader* fast, std::int64_t& out_drained) noexcept {
     const std::ptrdiff_t rseq_off = __rseq_offset;
@@ -248,7 +239,7 @@ struct ArchBackend {
         ".popsection\n\t"
         : [idx] "=&r"(idx), [slot] "=&r"(slot), [val] "=&r"(val)
         : [rseq_off] "r"(rseq_off), [fast] "r"(fast), [base] "r"(base),
-          [max_cpus] "i"(kHspMaxCpus), [shift] "i"(kSlotShift)
+          [max_cpus] "i"(kSharedPtrMaxCpus), [shift] "i"(kSlotShift)
         : "memory", "cc"
         : no_drain);
     out_drained = static_cast<std::int64_t>(val - 1U);
@@ -258,6 +249,6 @@ struct ArchBackend {
   }
 };
 
-}  // namespace theta::hyper_shared_ptr::detail
+}  // namespace theta::detail::shared_ptr
 
-#endif  // THETA_ARCH_X86_64 && THETA_HSP_USE_RSEQ_ASM
+#endif  // THETA_ARCH_X86_64 && THETA_SHARED_PTR_USE_RSEQ_ASM

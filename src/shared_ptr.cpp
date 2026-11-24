@@ -1,4 +1,4 @@
-// FILENAME: src/hyper_shared_ptr.cpp
+// FILENAME: src/shared_ptr.cpp
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
 
@@ -13,7 +13,7 @@
 #include <ctime>
 #include <mutex>
 #include <new>
-#include <theta/hyper_shared_ptr.hpp>
+#include <theta/shared_ptr.hpp>
 #include <thread>
 
 #if THETA_OS_LINUX
@@ -28,12 +28,11 @@
 #endif
 #endif
 
-namespace theta::hyper_shared_ptr::detail {
+namespace theta::detail::shared_ptr {
 
 constinit const void* g_theta_sp_vptr = nullptr;
 constinit std::int64_t* g_rseq_slab_base = nullptr;
 constinit void** g_rseq_keepalive_ptrs = nullptr;
-constinit std::atomic<std::uint64_t>* g_hsp_slab_base = nullptr;
 
 namespace {
 
@@ -97,7 +96,7 @@ void note_involuntary_harvest_membarrier() noexcept {
 
 void broadcast_rseq_membarrier(bool count_toward_storm) noexcept {
 #if THETA_OS_LINUX
-#if THETA_HSP_USE_RSEQ_ASM
+#if THETA_SHARED_PTR_USE_RSEQ_ASM
   ::syscall(SYS_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0, 0);
 #else
   std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -140,11 +139,11 @@ std::int32_t parse_linux_possible_cpus() noexcept {
         max_id = cur;
       }
       const std::int32_t count = max_id + 1;
-      if (count >= 1 && count <= kHspMaxCpus) {
+      if (count >= 1 && count <= kSharedPtrMaxCpus) {
         return count;
       }
-      if (count > kHspMaxCpus) {
-        return kHspMaxCpus;
+      if (count > kSharedPtrMaxCpus) {
+        return kSharedPtrMaxCpus;
       }
     }
   }
@@ -153,8 +152,8 @@ std::int32_t parse_linux_possible_cpus() noexcept {
   if (hc == 0U) {
     return 1;
   }
-  return hc > static_cast<unsigned int>(kHspMaxCpus)
-             ? kHspMaxCpus
+  return hc > static_cast<unsigned int>(kSharedPtrMaxCpus)
+             ? kSharedPtrMaxCpus
              : static_cast<std::int32_t>(hc);
 }
 
@@ -176,12 +175,17 @@ void* map_striped_region(std::size_t bytes) noexcept {
 
 // ============================================================================
 // ABA-Free Striped Slot Allocator + Zero-Guard POD `initial-exec` TLS Cache
+// All fields zero-initialized so the 512 KiB stack resides in `.bss`
+// (`NOBITS`).
 // ============================================================================
 class StripedSlotAllocator {
  public:
   std::uint32_t alloc_from_global(std::uint32_t* batch_out,
                                   std::uint32_t want) noexcept {
     lock();
+    if (next_fresh_ == 0U) [[unlikely]] {
+      next_fresh_ = 1U;
+    }
     std::uint32_t got = 0U;
     while (got < want && free_top_ > 0U) {
       batch_out[got++] = free_stack_[--free_top_];
@@ -219,13 +223,12 @@ class StripedSlotAllocator {
   void unlock() noexcept { lock_.store(0U, std::memory_order_release); }
 
   std::atomic<std::uint8_t> lock_{0};
-  std::uint32_t next_fresh_{1};
+  std::uint32_t next_fresh_{0};
   std::uint32_t free_top_{0};
   std::uint32_t free_stack_[kMaxStripedSlots]{};
 };
 
 constinit StripedSlotAllocator g_rseq_slot_alloc{};
-constinit StripedSlotAllocator g_hsp_slot_alloc{};
 
 struct PodTlsSlotState {
   static constexpr std::uint32_t kCap = 32U;
@@ -233,9 +236,7 @@ struct PodTlsSlotState {
 
   bool cleanup_registered;
   std::uint32_t rseq_count;
-  std::uint32_t hsp_count;
   std::uint32_t rseq_ids[kCap];
-  std::uint32_t hsp_ids[kCap];
 };
 
 #if THETA_OS_LINUX
@@ -253,10 +254,6 @@ void on_thread_exit_flush_slots(void* /*arg*/) noexcept {
     g_rseq_slot_alloc.free_to_global(g_tls_slots.rseq_ids,
                                      g_tls_slots.rseq_count);
     g_tls_slots.rseq_count = 0U;
-  }
-  if (g_tls_slots.hsp_count > 0U) {
-    g_hsp_slot_alloc.free_to_global(g_tls_slots.hsp_ids, g_tls_slots.hsp_count);
-    g_tls_slots.hsp_count = 0U;
   }
 }
 
@@ -287,7 +284,7 @@ void ensure_runtime_init() noexcept {
     }
 
     const std::size_t total_cells =
-        static_cast<std::size_t>(kHspMaxCpus) * kMaxStripedSlots;
+        static_cast<std::size_t>(kSharedPtrMaxCpus) * kMaxStripedSlots;
 
     if (g_rseq_slab_base == nullptr) {
       g_rseq_slab_base = static_cast<std::int64_t*>(
@@ -301,19 +298,15 @@ void ensure_runtime_init() noexcept {
       g_rseq_keepalive_ptrs = static_cast<void**>(
           map_striped_region(kMaxStripedSlots * sizeof(void*)));
     }
-    if (g_hsp_slab_base == nullptr) {
-      g_hsp_slab_base = static_cast<std::atomic<std::uint64_t>*>(
-          map_striped_region(total_cells * sizeof(std::uint64_t)));
-    }
 
-#if THETA_HSP_USE_RSEQ_ASM
+#if THETA_SHARED_PTR_USE_RSEQ_ASM
     bool rseq_tls_ok = false;
     if (__rseq_size > 0U) {
       const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
       const auto* cpu_ptr =
           reinterpret_cast<const std::int32_t*>(tp + __rseq_offset + 4);
       const std::int32_t c = __atomic_load_n(cpu_ptr, __ATOMIC_RELAXED);
-      rseq_tls_ok = (c >= 0 && c < kHspMaxCpus);
+      rseq_tls_ok = (c >= 0 && c < kSharedPtrMaxCpus);
     }
     const long rc = ::syscall(
         SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0);
@@ -326,7 +319,6 @@ void ensure_runtime_init() noexcept {
                            (g_rseq_keepalive_ptrs != nullptr);
 #endif
 
-    // Also seed `g_theta_sp_vptr` eagerly while single-threaded at startup!
     if (__atomic_load_n(&g_theta_sp_vptr, __ATOMIC_RELAXED) == nullptr) {
       ThetaSpCountedBase sample(0U);
       record_theta_sp_vptr(&sample);
@@ -342,7 +334,7 @@ void ensure_runtime_init() noexcept {
 // slabs at process startup while `mm->mm_users == 1`, avoiding Linux's ~8 ms
 // `synchronize_rcu()` grace-period stall when first called after
 // `pthread_create`.
-[[gnu::constructor(101)]] void eager_init_hsp_runtime() noexcept {
+[[gnu::constructor(101)]] void eager_init_shared_ptr_runtime() noexcept {
   ensure_runtime_init();
 }
 
@@ -378,35 +370,6 @@ void free_rseq_slot(std::uint32_t slot) noexcept {
   g_tls_slots.rseq_ids[g_tls_slots.rseq_count++] = slot;
 }
 
-std::uint32_t alloc_hsp_slot() noexcept {
-  if (g_tls_slots.hsp_count == 0U) [[unlikely]] {
-    ensure_thread_cleanup_registered();
-    g_tls_slots.hsp_count = g_hsp_slot_alloc.alloc_from_global(
-        g_tls_slots.hsp_ids, PodTlsSlotState::kRefill);
-    if (g_tls_slots.hsp_count == 0U) [[unlikely]] {
-      return 0U;
-    }
-  }
-  return g_tls_slots.hsp_ids[--g_tls_slots.hsp_count];
-}
-
-void free_hsp_slot(std::uint32_t slot) noexcept {
-  if (slot == 0U) {
-    return;
-  }
-  if (g_tls_slots.hsp_count == PodTlsSlotState::kCap) [[unlikely]] {
-    ensure_thread_cleanup_registered();
-    g_hsp_slot_alloc.free_to_global(g_tls_slots.hsp_ids,
-                                    PodTlsSlotState::kRefill);
-    std::memmove(g_tls_slots.hsp_ids,
-                 g_tls_slots.hsp_ids + PodTlsSlotState::kRefill,
-                 (PodTlsSlotState::kCap - PodTlsSlotState::kRefill) *
-                     sizeof(std::uint32_t));
-    g_tls_slots.hsp_count -= PodTlsSlotState::kRefill;
-  }
-  g_tls_slots.hsp_ids[g_tls_slots.hsp_count++] = slot;
-}
-
 THETA_FORCE_INLINE void lock_cb(ThetaSpCountedBase* cb) noexcept {
   while (__atomic_exchange_n(&cb->fast_.reg_lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
     while (__atomic_load_n(&cb->fast_.reg_lock, __ATOMIC_RELAXED) != 0U) {
@@ -432,7 +395,7 @@ void append_reg_cpu_locked(PerCpuSlotMeta& meta, std::uint16_t cpu) noexcept {
         meta.overflow_cap == 0U
             ? 16U
             : static_cast<std::uint16_t>(meta.overflow_cap >= 4096U
-                                             ? kHspMaxCpus
+                                             ? kSharedPtrMaxCpus
                                              : meta.overflow_cap * 4U);
     auto* next_buf = new (std::nothrow) std::uint16_t[new_cap];
     if (next_buf == nullptr) [[unlikely]] {
@@ -529,6 +492,24 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
   return true;
 }
 
+// ============================================================================
+// Cache-Line-Striped Lock + Wait Table for `std::atomic<SharedPtr<T>>`
+// ============================================================================
+struct alignas(64) AtomicPtrShard {
+  std::atomic<std::uint8_t> lock{0};
+  std::atomic<std::uint32_t> seq{0};
+  std::atomic<std::uint32_t> waiters{0};
+};
+
+constexpr std::size_t kAtomicPtrShards = 64U;
+constinit AtomicPtrShard g_atomic_ptr_shards[kAtomicPtrShards]{};
+
+AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
+  std::uintptr_t v = reinterpret_cast<std::uintptr_t>(addr);
+  v = (v >> 4U) ^ (v >> 10U) ^ (v >> 16U);
+  return g_atomic_ptr_shards[v & (kAtomicPtrShards - 1U)];
+}
+
 }  // namespace
 
 [[gnu::aligned(64)]] void ThetaSpCountedBase::_M_dispose() noexcept {
@@ -588,14 +569,14 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
     const auto* cpu_ptr =
         reinterpret_cast<const std::int32_t*>(tp + __rseq_offset + 4);
     const std::int32_t c = __atomic_load_n(cpu_ptr, __ATOMIC_RELAXED);
-    if (c >= 0 && c < kHspMaxCpus) [[likely]] {
+    if (c >= 0 && c < kSharedPtrMaxCpus) [[likely]] {
       return c;
     }
   }
 #endif
 #if THETA_OS_LINUX
   const int sc = ::sched_getcpu();
-  if (sc >= 0 && sc < kHspMaxCpus) {
+  if (sc >= 0 && sc < kSharedPtrMaxCpus) {
     return static_cast<std::int32_t>(sc);
   }
 #endif
@@ -694,9 +675,9 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
   }
 
   if (mode == kModeUnpromoted) {
-    // Reached only when `has_weak_or_std != 0` (e.g. a `WeakPtr` was formed).
-    // Transition to `kModeAtomicRetired` before unlocking so any concurrent
-    // `WeakPtr::lock()` arbitrates atomically on `_M_use_count`.
+    // Reached only when `has_weak_or_std != 0` (e.g. a `WeakPtr` or
+    // `enable_shared_from_this` was formed). Transition to `kModeAtomicRetired`
+    // before unlocking so concurrent `lock()` arbitrates on `_M_use_count`.
     __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
     unlock_cb(cb);
     pi->_M_release();
@@ -782,8 +763,6 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
   }
   meta.num_reg_cpus = 0U;
   meta.central_tickets.store(0, std::memory_order_relaxed);
-  // Keep `cb->fast_.slot_id` bound until `_M_destroy()` so no racing reader of
-  // `slot_id` can ever observe ABA reuse while `cb` still has live references.
 
   for (std::int64_t i = 0; i < h_after - 1; ++i) {
     cb->_M_add_ref_copy();
@@ -984,130 +963,45 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
   unlock_cb(old_cb);
 }
 
-// ============================================================================
-// `HyperControlBlock` (`theta::HyperSharedPtr<T>`) Cold Slow Paths
-// ============================================================================
-[[gnu::aligned(64)]] std::uint32_t alloc_hsp_slot_and_init_cpu(
-    std::int32_t cpu) noexcept {
-  ensure_runtime_init();
-  if (g_hsp_slab_base == nullptr) [[unlikely]] {
-    return 0U;
+[[gnu::aligned(64)]] void atomic_ptr_lock(const void* addr) noexcept {
+  AtomicPtrShard& s = shard_for_addr(addr);
+  while (s.lock.exchange(1U, std::memory_order_acquire) != 0U) {
+    while (s.lock.load(std::memory_order_relaxed) != 0U) {
+      ::theta::arch::cpu_relax();
+    }
   }
-  const std::uint32_t slot = alloc_hsp_slot();
-  if (slot == 0U) [[unlikely]] {
-    return 0U;
-  }
-  const std::size_t idx = (static_cast<std::size_t>(cpu) << kSlotShift) + slot;
-  g_hsp_slab_base[idx].store(3ULL, std::memory_order_release);
-  return slot;
 }
 
-[[gnu::aligned(64)]] void hsp_activate_shard_slow(HyperControlBlock* cb,
-                                                  std::int32_t cpu) noexcept {
-  if (cb->slot_id_ == 0U || g_hsp_slab_base == nullptr) [[unlikely]] {
-    cb->active_shards_.fetch_add(1U, std::memory_order_relaxed);
-    return;
-  }
-  const std::size_t idx =
-      (static_cast<std::size_t>(cpu) << kSlotShift) + cb->slot_id_;
-  auto& shard = g_hsp_slab_base[idx];
-  std::uint64_t cur = shard.load(std::memory_order_relaxed);
-  while (true) {
-    if ((cur & 1ULL) != 0ULL) {
-      if (shard.compare_exchange_weak(cur, cur + 2ULL,
-                                      std::memory_order_relaxed,
-                                      std::memory_order_relaxed)) {
-        return;
-      }
+[[gnu::aligned(64)]] void atomic_ptr_unlock(const void* addr) noexcept {
+  AtomicPtrShard& s = shard_for_addr(addr);
+  s.lock.store(0U, std::memory_order_release);
+}
+
+[[gnu::aligned(64)]] void atomic_ptr_unlock_and_notify(
+    const void* addr, bool notify_all) noexcept {
+  AtomicPtrShard& s = shard_for_addr(addr);
+  s.seq.fetch_add(1U, std::memory_order_relaxed);
+  const bool has_waiters = s.waiters.load(std::memory_order_acquire) != 0U;
+  s.lock.store(0U, std::memory_order_release);
+  if (has_waiters) [[unlikely]] {
+    if (notify_all) {
+      s.seq.notify_all();
     } else {
-      cb->active_shards_.fetch_add(1U, std::memory_order_relaxed);
-      if (shard.compare_exchange_strong(cur, 3ULL, std::memory_order_acq_rel,
-                                        std::memory_order_relaxed)) {
-        return;
-      }
-      cb->active_shards_.fetch_sub(1U, std::memory_order_relaxed);
+      s.seq.notify_one();
     }
   }
 }
 
-[[gnu::aligned(64)]] void hsp_destroy_last_strong_slow(
-    HyperControlBlock* cb) noexcept {
-  if (cb->slot_id_ != 0U) {
-    free_hsp_slot(cb->slot_id_);
-    cb->slot_id_ = 0U;
-  }
-  if (cb->dispose_fn_ != nullptr) {
-    cb->dispose_fn_(cb);
-  }
-  hsp_weak_release_slow(cb);
+[[gnu::aligned(64)]] std::uint32_t atomic_ptr_seq(const void* addr) noexcept {
+  return shard_for_addr(addr).seq.load(std::memory_order_relaxed);
 }
 
-[[gnu::aligned(64)]] void hsp_weak_release_slow(
-    HyperControlBlock* cb) noexcept {
-  if (cb->weak_refs_.fetch_sub(1U, std::memory_order_acq_rel) == 1U) {
-    if (cb->destroy_fn_ != nullptr) {
-      cb->destroy_fn_(cb);
-    } else {
-      delete cb;
-    }
-  }
+[[gnu::aligned(64)]] void atomic_ptr_wait_seq(
+    const void* addr, std::uint32_t expected_seq) noexcept {
+  AtomicPtrShard& s = shard_for_addr(addr);
+  s.waiters.fetch_add(1U, std::memory_order_acq_rel);
+  s.seq.wait(expected_seq, std::memory_order_acquire);
+  s.waiters.fetch_sub(1U, std::memory_order_release);
 }
 
-[[gnu::aligned(64)]] bool hsp_weak_lock_slow(HyperControlBlock* cb,
-                                             std::int32_t cpu) noexcept {
-  std::uint32_t active = cb->active_shards_.load(std::memory_order_acquire);
-  while (active != 0U) {
-    if (cb->active_shards_.compare_exchange_weak(active, active + 1U,
-                                                 std::memory_order_acq_rel,
-                                                 std::memory_order_acquire)) {
-      if (cb->slot_id_ != 0U && g_hsp_slab_base != nullptr) {
-        hsp_inc_on_cpu(cb, cpu);
-        cb->active_shards_.fetch_sub(1U, std::memory_order_acq_rel);
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
-[[gnu::aligned(64)]] std::size_t hsp_use_count_slow(
-    const HyperControlBlock* cb) noexcept {
-  if (cb == nullptr) {
-    return 0U;
-  }
-  const std::uint32_t active =
-      cb->active_shards_.load(std::memory_order_acquire);
-  if (active == 0U) {
-    return 0U;
-  }
-  if (cb->slot_id_ == 0U || g_hsp_slab_base == nullptr) {
-    return active;
-  }
-  const std::int32_t limit = max_possible_cpus();
-  std::size_t sum = 0U;
-  std::uint32_t seen_active = 0U;
-  for (std::int32_t c = 0; c < limit; ++c) {
-    const std::size_t idx =
-        (static_cast<std::size_t>(c) << kSlotShift) + cb->slot_id_;
-    const std::uint64_t v =
-        g_hsp_slab_base[idx].load(std::memory_order_relaxed);
-    if ((v & 1ULL) != 0ULL) {
-      sum += static_cast<std::size_t>(v >> 1U);
-      ++seen_active;
-    }
-  }
-  if (seen_active < active) {
-    for (std::int32_t c = limit; c < kHspMaxCpus; ++c) {
-      const std::size_t idx =
-          (static_cast<std::size_t>(c) << kSlotShift) + cb->slot_id_;
-      const std::uint64_t v =
-          g_hsp_slab_base[idx].load(std::memory_order_relaxed);
-      if ((v & 1ULL) != 0ULL) {
-        sum += static_cast<std::size_t>(v >> 1U);
-      }
-    }
-  }
-  return sum;
-}
-
-}  // namespace theta::hyper_shared_ptr::detail
+}  // namespace theta::detail::shared_ptr

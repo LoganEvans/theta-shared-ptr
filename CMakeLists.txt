@@ -2,7 +2,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 project(
-  theta-hyper-shared-ptr
+  theta-shared-ptr
   VERSION 0.2.0
   LANGUAGES CXX)
 
@@ -35,17 +35,15 @@ else()
   add_compile_options(-O3)
 endif()
 
-add_library(theta-hyper-shared-ptr STATIC src/hyper_shared_ptr.cpp)
-add_library(theta::theta-hyper-shared-ptr ALIAS theta-hyper-shared-ptr)
-add_library(theta::hyper-shared-ptr ALIAS theta-hyper-shared-ptr)
-set_target_properties(theta-hyper-shared-ptr
-                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(theta-shared-ptr STATIC src/shared_ptr.cpp)
+add_library(theta::theta-shared-ptr ALIAS theta-shared-ptr)
+add_library(theta::shared-ptr ALIAS theta-shared-ptr)
+set_target_properties(theta-shared-ptr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(
-  theta-hyper-shared-ptr
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(theta-hyper-shared-ptr PUBLIC Threads::Threads)
+  theta-shared-ptr PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(theta-shared-ptr PUBLIC Threads::Threads)
 
 if(BUILD_TESTING)
   find_package(GTest REQUIRED)
@@ -56,20 +54,20 @@ if(BUILD_TESTING)
   # TUs.
   add_library(opaque_std_interop OBJECT tests/opaque_std_interop.cpp)
 
-  add_executable(hyper_shared_ptr_tests tests/test_hyper_shared_ptr.cpp
-                                        $<TARGET_OBJECTS:opaque_std_interop>)
-  target_link_libraries(hyper_shared_ptr_tests
-                        PRIVATE theta::theta-hyper-shared-ptr GTest::gtest_main)
+  add_executable(shared_ptr_tests tests/test_shared_ptr.cpp
+                                  $<TARGET_OBJECTS:opaque_std_interop>)
+  target_link_libraries(shared_ptr_tests PRIVATE theta::theta-shared-ptr
+                                                 GTest::gtest_main)
   gtest_discover_tests(
-    hyper_shared_ptr_tests DISCOVERY_TIMEOUT 10
+    shared_ptr_tests DISCOVERY_TIMEOUT 10
     PROPERTIES
     TIMEOUT 30)
 
-  add_executable(hyper_shared_ptr_hardened_tests tests/test_hardened.cpp)
-  target_link_libraries(hyper_shared_ptr_hardened_tests
-                        PRIVATE theta::theta-hyper-shared-ptr GTest::gtest_main)
+  add_executable(shared_ptr_hardened_tests tests/test_hardened.cpp)
+  target_link_libraries(shared_ptr_hardened_tests
+                        PRIVATE theta::theta-shared-ptr GTest::gtest_main)
   gtest_discover_tests(
-    hyper_shared_ptr_hardened_tests DISCOVERY_TIMEOUT 10
+    shared_ptr_hardened_tests DISCOVERY_TIMEOUT 10
     PROPERTIES
     TIMEOUT 30)
 endif()
@@ -79,17 +77,17 @@ if(BUILD_BENCHMARK
    OR "$ENV{BUILD_BENCHMARK}" STREQUAL "true")
   find_package(benchmark REQUIRED)
 
-  add_executable(hyper_shared_ptr_bench benchmarks/bench_hyper_shared_ptr.cpp)
+  add_executable(shared_ptr_bench benchmarks/bench_shared_ptr.cpp)
   target_link_libraries(
-    hyper_shared_ptr_bench PRIVATE theta::theta-hyper-shared-ptr
-                                   benchmark::benchmark Threads::Threads)
+    shared_ptr_bench PRIVATE theta::theta-shared-ptr benchmark::benchmark
+                             Threads::Threads)
 endif()
 
 theta_install_package(
   TARGETS
-  theta-hyper-shared-ptr
+  theta-shared-ptr
   FIND_DEPENDENCIES
   Threads
   DESCRIPTION
-  "8192-CPU rseq std::shared_ptr ABI-compatible and handle-tagged concurrent smart pointers"
+  "8192-CPU rseq std::shared_ptr ABI-compatible concurrent smart pointer and KeepAlive"
 )
