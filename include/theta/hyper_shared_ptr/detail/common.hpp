@@ -46,22 +46,25 @@ inline constexpr std::uint8_t kModeUnpromoted = 0U;
 inline constexpr std::uint8_t kModePerCpuActive = 1U;
 inline constexpr std::uint8_t kModeAtomicRetired = 2U;
 
-// Standard-layout hot header embedded inside `ThetaSpCountedBase` so inline
-// `rseq` assembly accesses `slot_id` (+0), `fast_active` (+4), and
-// `managed_ptr` (+8) with compile-time `offsetof` verification and zero
-// `-Winvalid-offsetof` warnings.
+// Standard-layout 8-byte hot header embedded inside `ThetaSpCountedBase` so
+// inline `rseq` assembly accesses `slot_id` (+0) and `fast_active` (+4) with
+// compile-time `offsetof` verification, while `ThetaSpCountedBase` itself fits
+// in just 32 bytes (`40B` total with an inplace `uint64_t`).
 struct SpFastHeader {
   std::uint32_t slot_id{0};
   std::uint8_t fast_active{0};
   std::uint8_t mode{kModeUnpromoted};
-  std::uint16_t pad{0};
-  void* managed_ptr{nullptr};
+  std::uint8_t has_weak_or_std{0};
+  std::uint8_t reg_lock{0};
 };
 
 static_assert(std::is_standard_layout_v<SpFastHeader>);
+static_assert(sizeof(SpFastHeader) == 8);
 static_assert(offsetof(SpFastHeader, slot_id) == 0);
 static_assert(offsetof(SpFastHeader, fast_active) == 4);
-static_assert(offsetof(SpFastHeader, managed_ptr) == 8);
+static_assert(offsetof(SpFastHeader, mode) == 5);
+static_assert(offsetof(SpFastHeader, has_weak_or_std) == 6);
+static_assert(offsetof(SpFastHeader, reg_lock) == 7);
 
 #if THETA_HSP_HAS_GLIBCXX_ABI
 using StdSpCountedBase = std::_Sp_counted_base<__gnu_cxx::_S_atomic>;
@@ -124,72 +127,57 @@ class ThetaSpCountedBase;
 extern const void* g_theta_sp_vptr;
 void record_theta_sp_vptr(const ThetaSpCountedBase* sample) noexcept;
 
-class alignas(64) ThetaSpCountedBase final : public StdSpCountedBase {
- public:
-  using DisposeFn = void (*)(ThetaSpCountedBase*) noexcept;
-  using DestroyFn = void (*)(ThetaSpCountedBase*) noexcept;
-  using GetDeleterFn = void* (*)(ThetaSpCountedBase*,
-                                 const std::type_info&) noexcept;
+struct alignas(8) SpColdOps {
+  void (*dispose)(ThetaSpCountedBase*) noexcept;
+  void (*destroy)(ThetaSpCountedBase*) noexcept;
+  void (*dispose_and_destroy)(ThetaSpCountedBase*) noexcept;
+  void* (*get_deleter)(ThetaSpCountedBase*, const std::type_info&) noexcept;
+};
 
-  ThetaSpCountedBase(void* managed_ptr, DisposeFn dispose_fn,
-                     DestroyFn destroy_fn,
-                     GetDeleterFn get_deleter_fn = nullptr) noexcept
-      : fast_{0U, 0U, kModeUnpromoted, 0U, managed_ptr},
-        dispose_fn_(dispose_fn),
-        destroy_fn_(destroy_fn),
-        get_deleter_fn_(get_deleter_fn) {
+// Compact 32-byte control block (`vptr` [8B] + `_M_use_count/_M_weak_count`
+// [8B] + `SpFastHeader` [8B] + `ops_or_size_` [8B]).
+// Cold Per-CPU coordination state (`central_tickets`, `inline_cpus`,
+// `overflow_cpus`, `harvest_count`) lives out-of-line in `g_rseq_slot_meta`
+// indexed by `fast_.slot_id` and is touched only if the object is promoted.
+class ThetaSpCountedBase final : public StdSpCountedBase {
+ public:
+  explicit ThetaSpCountedBase(std::uintptr_t ops_or_size) noexcept
+      : ops_or_size_(ops_or_size) {
+#if !(defined(__GXX_ABI_VERSION) && !THETA_ASAN_ENABLED)
     if (__atomic_load_n(&g_theta_sp_vptr, __ATOMIC_RELAXED) == nullptr)
         [[unlikely]] {
       record_theta_sp_vptr(this);
     }
+#endif
   }
 
   ~ThetaSpCountedBase() noexcept override = default;
 
   // Key function defined in `src/hyper_shared_ptr.cpp` to anchor a single
-  // canonical vtable address (`g_theta_sp_vptr`) across the entire process.
+  // canonical vtable address across the entire process.
   void _M_dispose() noexcept override;
+  void _M_destroy() noexcept override;
+  void* _M_get_deleter(const std::type_info& ti) noexcept override;
 
-  void _M_destroy() noexcept override {
-    if (overflow_cpus_ != nullptr) [[unlikely]] {
-      delete[] overflow_cpus_;
-      overflow_cpus_ = nullptr;
-    }
-    if (destroy_fn_ != nullptr) {
-      destroy_fn_(this);
-    } else {
-      delete this;
-    }
-  }
-
-  void* _M_get_deleter(const std::type_info& ti) noexcept override {
-    if (get_deleter_fn_ != nullptr) {
-      return get_deleter_fn_(this, ti);
-    }
-    return nullptr;
-  }
-
-  // Cache Line 0 (`+0 .. +63`): 100% read-only during steady-state Per-CPU Mode
-  SpFastHeader fast_;
-  DisposeFn dispose_fn_;
-  DestroyFn destroy_fn_;
-  GetDeleterFn get_deleter_fn_;
-
-  // Cache Line 1 (`+64 .. +127`): Cold registration, ticket, & harvest state
-  alignas(64) std::atomic<std::int64_t> central_tickets_{0};
-  std::atomic<std::uint8_t> reg_lock_{0};
-  std::uint8_t has_weak_or_std_{0};
-  std::uint16_t num_reg_cpus_{0};
-  std::int32_t unpromoted_theta_refs_{1};
-  std::uint32_t harvest_count_{0};
-  std::uint16_t overflow_cap_{0};
-  std::uint16_t inline_cpus_[8]{};
-  std::uint16_t* overflow_cpus_{nullptr};
+  SpFastHeader fast_{};
+  // LSB == 1: `(sizeof(SpInplaceStorage<T>) << 1) | 1` for zero-indirect-call
+  //           sized `::operator delete` when `T` is trivially destructible and
+  //           standard-aligned.
+  // LSB == 0: `const SpColdOps*` descriptor in `.rodata`.
+  std::uintptr_t ops_or_size_{0};
 };
+
+static_assert(sizeof(ThetaSpCountedBase) == 4 * sizeof(void*));
+
+#if defined(__GXX_ABI_VERSION) && !THETA_ASAN_ENABLED
+extern const void* const kThetaSpVtableSym[] asm(
+    "_ZTVN5theta16hyper_shared_ptr6detail18ThetaSpCountedBaseE");
+#endif
 
 // Global runtime pointers exposed for zero-indirection `rseq` inline fast paths
 extern const void* g_theta_sp_vptr;
 extern std::int64_t* g_rseq_slab_base;
+extern void** g_rseq_keepalive_ptrs;
 extern std::atomic<std::uint64_t>* g_hsp_slab_base;
 
 void record_theta_sp_vptr(const ThetaSpCountedBase* sample) noexcept;
@@ -208,7 +196,8 @@ void sp_adopt_from_std_move(StdSpCountedBase* pi) noexcept;
 [[nodiscard]] bool sp_weak_lock_slow(StdSpCountedBase* pi) noexcept;
 
 // KeepAlive support on `ThetaSpCountedBase`
-void sp_pin_for_keepalive(ThetaSpCountedBase* cb) noexcept;
+[[nodiscard]] bool sp_pin_for_keepalive(ThetaSpCountedBase* cb,
+                                        void* managed_ptr) noexcept;
 void sp_register_keepalive_cpu_slow(ThetaSpCountedBase* cb) noexcept;
 void sp_keepalive_retire_old(ThetaSpCountedBase* old_cb) noexcept;
 
@@ -218,7 +207,11 @@ THETA_FORCE_INLINE bool is_theta_sp(const StdSpCountedBase* pi) noexcept {
   }
   const void* vptr = nullptr;
   std::memcpy(&vptr, static_cast<const void*>(pi), sizeof(vptr));
-  return vptr == g_theta_sp_vptr && g_theta_sp_vptr != nullptr;
+#if defined(__GXX_ABI_VERSION) && !THETA_ASAN_ENABLED
+  return vptr == static_cast<const void*>(kThetaSpVtableSym + 2);
+#else
+  return vptr == __atomic_load_n(&g_theta_sp_vptr, __ATOMIC_RELAXED);
+#endif
 }
 
 // ============================================================================

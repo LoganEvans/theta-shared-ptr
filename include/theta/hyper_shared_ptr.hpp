@@ -91,15 +91,37 @@ THETA_FORCE_INLINE void sp_release(StdSpCountedBase* pi) noexcept {
       sp_release_slow(pi);
       return;
     }
-    const std::uint8_t mode =
-        __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE);
-    if (mode == kModeAtomicRetired) {
-      pi->_M_release();
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
+    !THETA_TSAN_ENABLED
+    std::uint32_t state32 = 0U;
+    std::memcpy(&state32, &cb->fast_.fast_active, sizeof(state32));
+    std::atomic_signal_fence(std::memory_order_acquire);
+    if ((state32 & 0x00FFFFFFU) == 0U) [[likely]] {
+      const std::uintptr_t tag = cb->ops_or_size_;
+      if ((tag & 1U) != 0U) [[likely]] {
+        ::operator delete(static_cast<void*>(cb), tag >> 1U);
+      } else {
+        reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
+      }
       return;
     }
+    const auto mode = static_cast<std::uint8_t>((state32 >> 8U) & 0xFFU);
+#else
+    const std::uint8_t mode =
+        __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE);
     if (mode == kModeUnpromoted &&
-        __atomic_load_n(&cb->has_weak_or_std_, __ATOMIC_ACQUIRE) == 0U &&
-        pi->_M_get_use_count() == 1L) [[likely]] {
+        __atomic_load_n(&cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) == 0U)
+        [[likely]] {
+      const std::uintptr_t tag = cb->ops_or_size_;
+      if ((tag & 1U) != 0U) [[likely]] {
+        ::operator delete(static_cast<void*>(cb), tag >> 1U);
+      } else {
+        reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
+      }
+      return;
+    }
+#endif
+    if (mode == kModeAtomicRetired) {
       pi->_M_release();
       return;
     }
@@ -114,10 +136,31 @@ struct SpInplaceStorage final {
   ThetaSpCountedBase base;
   alignas(T) unsigned char storage[sizeof(T)];
 
+  static constexpr bool kStandardAlign =
+      alignof(T) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+  static constexpr bool kTrivialFastDelete =
+      std::is_trivially_destructible_v<T> && kStandardAlign;
+
+  static void* alloc_raw() {
+    if constexpr (kStandardAlign) {
+      return ::operator new(sizeof(SpInplaceStorage));
+    } else {
+      return ::operator new(sizeof(SpInplaceStorage),
+                            std::align_val_t{alignof(SpInplaceStorage)});
+    }
+  }
+
+  static void free_raw(void* p) noexcept {
+    if constexpr (kStandardAlign) {
+      ::operator delete(p, sizeof(SpInplaceStorage));
+    } else {
+      ::operator delete(p, sizeof(SpInplaceStorage),
+                        std::align_val_t{alignof(SpInplaceStorage)});
+    }
+  }
+
   template <typename... Args>
-  explicit SpInplaceStorage(Args&&... args)
-      : base(static_cast<void*>(storage), &dispose_impl, &destroy_impl,
-             nullptr) {
+  explicit SpInplaceStorage(Args&&... args) : base(ops_or_size_value()) {
     ::new (static_cast<void*>(storage)) T(std::forward<Args>(args)...);
   }
 
@@ -131,8 +174,31 @@ struct SpInplaceStorage final {
   static void destroy_impl(ThetaSpCountedBase* b) noexcept {
     auto* self = reinterpret_cast<SpInplaceStorage*>(b);
     self->~SpInplaceStorage();
-    ::operator delete(static_cast<void*>(self),
-                      std::align_val_t{alignof(SpInplaceStorage)});
+    free_raw(static_cast<void*>(self));
+  }
+
+  static void dispose_and_destroy_impl(ThetaSpCountedBase* b) noexcept {
+    auto* self = reinterpret_cast<SpInplaceStorage*>(b);
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      self->ptr()->~T();
+    }
+    self->~SpInplaceStorage();
+    free_raw(static_cast<void*>(self));
+  }
+
+  static inline constexpr SpColdOps kOps{
+      std::is_trivially_destructible_v<T> ? nullptr : &dispose_impl,
+      &destroy_impl,
+      &dispose_and_destroy_impl,
+      nullptr,
+  };
+
+  static constexpr std::uintptr_t ops_or_size_value() noexcept {
+    if constexpr (kTrivialFastDelete) {
+      return (sizeof(SpInplaceStorage) << 1U) | 1ULL;
+    } else {
+      return reinterpret_cast<std::uintptr_t>(&kOps);
+    }
   }
 };
 
@@ -142,10 +208,31 @@ struct SpDeleterStorage final {
   Ptr ptr;
   [[no_unique_address]] Deleter deleter;
 
+  static constexpr bool kStandardAlign =
+      alignof(Deleter) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__ &&
+      alignof(Ptr) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+
+  static void* alloc_raw() {
+    if constexpr (kStandardAlign) {
+      return ::operator new(sizeof(SpDeleterStorage));
+    } else {
+      return ::operator new(sizeof(SpDeleterStorage),
+                            std::align_val_t{alignof(SpDeleterStorage)});
+    }
+  }
+
+  static void free_raw(void* p) noexcept {
+    if constexpr (kStandardAlign) {
+      ::operator delete(p, sizeof(SpDeleterStorage));
+    } else {
+      ::operator delete(p, sizeof(SpDeleterStorage),
+                        std::align_val_t{alignof(SpDeleterStorage)});
+    }
+  }
+
   SpDeleterStorage(Ptr p, Deleter d) noexcept(
       std::is_nothrow_move_constructible_v<Deleter>)
-      : base(const_cast<void*>(static_cast<const volatile void*>(p)),
-             &dispose_impl, &destroy_impl, &get_deleter_impl),
+      : base(reinterpret_cast<std::uintptr_t>(&kOps)),
         ptr(p),
         deleter(std::move(d)) {}
 
@@ -157,8 +244,14 @@ struct SpDeleterStorage final {
   static void destroy_impl(ThetaSpCountedBase* b) noexcept {
     auto* self = reinterpret_cast<SpDeleterStorage*>(b);
     self->~SpDeleterStorage();
-    ::operator delete(static_cast<void*>(self),
-                      std::align_val_t{alignof(SpDeleterStorage)});
+    free_raw(static_cast<void*>(self));
+  }
+
+  static void dispose_and_destroy_impl(ThetaSpCountedBase* b) noexcept {
+    auto* self = reinterpret_cast<SpDeleterStorage*>(b);
+    self->deleter(self->ptr);
+    self->~SpDeleterStorage();
+    free_raw(static_cast<void*>(self));
   }
 
   static void* get_deleter_impl(ThetaSpCountedBase* b,
@@ -174,6 +267,13 @@ struct SpDeleterStorage final {
 #endif
     return nullptr;
   }
+
+  static inline constexpr SpColdOps kOps{
+      &dispose_impl,
+      &destroy_impl,
+      &dispose_and_destroy_impl,
+      &get_deleter_impl,
+  };
 };
 
 template <typename T>
@@ -269,14 +369,13 @@ class SharedPtr {
       return;
     }
     using Storage = hyper_shared_ptr::detail::SpDeleterStorage<Y*, Deleter>;
-    void* mem =
-        ::operator new(sizeof(Storage), std::align_val_t{alignof(Storage)});
+    void* mem = Storage::alloc_raw();
     try {
       auto* s = ::new (mem) Storage(ptr, std::move(deleter));
       ptr_ = ptr;
       pi_ = &s->base;
     } catch (...) {
-      ::operator delete(mem, std::align_val_t{alignof(Storage)});
+      Storage::free_raw(mem);
       deleter(ptr);
       throw;
     }
@@ -508,14 +607,13 @@ template <typename T, typename... Args>
 [[nodiscard]] SharedPtr<T> make_shared(Args&&... args) {
   using CleanT = std::remove_cv_t<T>;
   using Storage = hyper_shared_ptr::detail::SpInplaceStorage<CleanT>;
-  void* mem =
-      ::operator new(sizeof(Storage), std::align_val_t{alignof(Storage)});
+  void* mem = Storage::alloc_raw();
   try {
     auto* s = ::new (mem) Storage(std::forward<Args>(args)...);
     return SharedPtr<T>(s->ptr(), &s->base,
                         hyper_shared_ptr::detail::AdoptRefTag{});
   } catch (...) {
-    ::operator delete(mem, std::align_val_t{alignof(Storage)});
+    Storage::free_raw(mem);
     throw;
   }
 }
@@ -577,7 +675,7 @@ class WeakPtr {
       if (hyper_shared_ptr::detail::is_theta_sp(pi_)) {
         auto* cb =
             static_cast<hyper_shared_ptr::detail::ThetaSpCountedBase*>(pi_);
-        __atomic_store_n(&cb->has_weak_or_std_, 1U, __ATOMIC_RELEASE);
+        __atomic_store_n(&cb->fast_.has_weak_or_std, 1U, __ATOMIC_RELEASE);
       }
       pi_->_M_weak_add_ref();
     }
@@ -751,17 +849,39 @@ class KeepAlive {
   SharedPtr<T> reset(SharedPtr<T> next) {
     hyper_shared_ptr::detail::ThetaSpCountedBase* new_cb = nullptr;
     if (next.pi_ != nullptr) {
+      void* raw_managed =
+          const_cast<void*>(static_cast<const volatile void*>(next.get()));
       if (!hyper_shared_ptr::detail::is_theta_sp(next.pi_)) {
         // Wrap external `std::shared_ptr` control block inside a Theta CB so
         // `rseq` fast-path offsets are always valid.
+#if THETA_HSP_HAS_GLIBCXX_ABI
         std::shared_ptr<T> ext = next.to_std();
         T* raw_p = ext.get();
         next = SharedPtr<T>(
             raw_p, [hold = std::move(ext)](T*) mutable { hold.reset(); });
+#else
+        SharedPtr<T> ext = std::move(next);
+        T* raw_p = ext.get();
+        next = SharedPtr<T>(
+            raw_p, [hold = std::move(ext)](T*) mutable { hold.reset(); });
+#endif
       }
       new_cb =
           static_cast<hyper_shared_ptr::detail::ThetaSpCountedBase*>(next.pi_);
-      hyper_shared_ptr::detail::sp_pin_for_keepalive(new_cb);
+      if (!hyper_shared_ptr::detail::sp_pin_for_keepalive(new_cb,
+                                                          raw_managed)) {
+        // Aliasing collision with another `KeepAlive` sharing `new_cb` with a
+        // distinct `get()` pointer: wrap once so each gets its own slot.
+        SharedPtr<T> hold_inner = std::move(next);
+        T* raw_p = hold_inner.get();
+        next = SharedPtr<T>(raw_p, [hold = std::move(hold_inner)](T*) mutable {
+          hold.reset();
+        });
+        new_cb = static_cast<hyper_shared_ptr::detail::ThetaSpCountedBase*>(
+            next.pi_);
+        (void)hyper_shared_ptr::detail::sp_pin_for_keepalive(new_cb,
+                                                             raw_managed);
+      }
     }
 
     SharedPtr<T> ret;
@@ -781,13 +901,16 @@ class KeepAlive {
 
   [[nodiscard]] SharedPtr<T> get() const noexcept {
     hyper_shared_ptr::detail::ThetaSpCountedBase* cb = nullptr;
+    std::uint32_t slot = 0U;
     if (hyper_shared_ptr::detail::ArchBackend::try_rseq_keepalive_acquire(
-            &active_cb_, cb)) [[likely]] {
+            &active_cb_, cb, slot)) [[likely]] {
       if (cb == nullptr) {
         return SharedPtr<T>{};
       }
-      return SharedPtr<T>(static_cast<T*>(cb->fast_.managed_ptr), cb,
-                          hyper_shared_ptr::detail::AdoptRefTag{});
+      return SharedPtr<T>(
+          static_cast<T*>(
+              hyper_shared_ptr::detail::g_rseq_keepalive_ptrs[slot]),
+          cb, hyper_shared_ptr::detail::AdoptRefTag{});
     }
     return get_slow();
   }

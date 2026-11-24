@@ -32,9 +32,24 @@ namespace theta::hyper_shared_ptr::detail {
 
 constinit const void* g_theta_sp_vptr = nullptr;
 constinit std::int64_t* g_rseq_slab_base = nullptr;
+constinit void** g_rseq_keepalive_ptrs = nullptr;
 constinit std::atomic<std::uint64_t>* g_hsp_slab_base = nullptr;
 
 namespace {
+
+struct alignas(64) PerCpuSlotMeta {
+  std::atomic<std::int64_t> central_tickets{0};
+  std::uint64_t last_harvest_ms{0};
+  std::uint32_t rapid_harvest_streak{0};
+  std::uint16_t num_reg_cpus{0};
+  std::uint16_t overflow_cap{0};
+  std::uint16_t inline_cpus[8]{};
+  std::uint16_t* overflow_cpus{nullptr};
+};
+
+static_assert(sizeof(PerCpuSlotMeta) == 64);
+
+constinit PerCpuSlotMeta* g_rseq_slot_meta = nullptr;
 
 constinit std::atomic<bool> g_runtime_ready{false};
 constinit std::atomic<bool> g_runtime_init_lock{false};
@@ -278,6 +293,14 @@ void ensure_runtime_init() noexcept {
       g_rseq_slab_base = static_cast<std::int64_t*>(
           map_striped_region(total_cells * sizeof(std::int64_t)));
     }
+    if (g_rseq_slot_meta == nullptr) {
+      g_rseq_slot_meta = static_cast<PerCpuSlotMeta*>(
+          map_striped_region(kMaxStripedSlots * sizeof(PerCpuSlotMeta)));
+    }
+    if (g_rseq_keepalive_ptrs == nullptr) {
+      g_rseq_keepalive_ptrs = static_cast<void**>(
+          map_striped_region(kMaxStripedSlots * sizeof(void*)));
+    }
     if (g_hsp_slab_base == nullptr) {
       g_hsp_slab_base = static_cast<std::atomic<std::uint64_t>*>(
           map_striped_region(total_cells * sizeof(std::uint64_t)));
@@ -295,14 +318,17 @@ void ensure_runtime_init() noexcept {
     const long rc = ::syscall(
         SYS_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0);
     g_rseq_membarrier_ok =
-        rseq_tls_ok && (rc == 0) && (g_rseq_slab_base != nullptr);
+        rseq_tls_ok && (rc == 0) && (g_rseq_slab_base != nullptr) &&
+        (g_rseq_slot_meta != nullptr) && (g_rseq_keepalive_ptrs != nullptr);
 #else
-    g_rseq_membarrier_ok = (g_rseq_slab_base != nullptr);
+    g_rseq_membarrier_ok = (g_rseq_slab_base != nullptr) &&
+                           (g_rseq_slot_meta != nullptr) &&
+                           (g_rseq_keepalive_ptrs != nullptr);
 #endif
 
     // Also seed `g_theta_sp_vptr` eagerly while single-threaded at startup!
     if (__atomic_load_n(&g_theta_sp_vptr, __ATOMIC_RELAXED) == nullptr) {
-      ThetaSpCountedBase sample(nullptr, nullptr, nullptr, nullptr);
+      ThetaSpCountedBase sample(0U);
       record_theta_sp_vptr(&sample);
     }
 
@@ -335,6 +361,9 @@ std::uint32_t alloc_rseq_slot() noexcept {
 void free_rseq_slot(std::uint32_t slot) noexcept {
   if (slot == 0U) {
     return;
+  }
+  if (g_rseq_keepalive_ptrs != nullptr) {
+    __atomic_store_n(&g_rseq_keepalive_ptrs[slot], nullptr, __ATOMIC_RELEASE);
   }
   if (g_tls_slots.rseq_count == PodTlsSlotState::kCap) [[unlikely]] {
     ensure_thread_cleanup_registered();
@@ -379,83 +408,86 @@ void free_hsp_slot(std::uint32_t slot) noexcept {
 }
 
 THETA_FORCE_INLINE void lock_cb(ThetaSpCountedBase* cb) noexcept {
-  while (cb->reg_lock_.exchange(1U, std::memory_order_acquire) != 0U) {
-    while (cb->reg_lock_.load(std::memory_order_relaxed) != 0U) {
+  while (__atomic_exchange_n(&cb->fast_.reg_lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
+    while (__atomic_load_n(&cb->fast_.reg_lock, __ATOMIC_RELAXED) != 0U) {
       ::theta::arch::cpu_relax();
     }
   }
 }
 
 THETA_FORCE_INLINE void unlock_cb(ThetaSpCountedBase* cb) noexcept {
-  cb->reg_lock_.store(0U, std::memory_order_release);
+  __atomic_store_n(&cb->fast_.reg_lock, 0U, __ATOMIC_RELEASE);
 }
 
-void append_reg_cpu_locked(ThetaSpCountedBase* cb, std::uint16_t cpu) noexcept {
-  const std::uint16_t n = cb->num_reg_cpus_;
+void append_reg_cpu_locked(PerCpuSlotMeta& meta, std::uint16_t cpu) noexcept {
+  const std::uint16_t n = meta.num_reg_cpus;
   if (n < 8U) [[likely]] {
-    cb->inline_cpus_[n] = cpu;
-    cb->num_reg_cpus_ = static_cast<std::uint16_t>(n + 1U);
+    meta.inline_cpus[n] = cpu;
+    meta.num_reg_cpus = static_cast<std::uint16_t>(n + 1U);
     return;
   }
   const std::uint16_t ext_idx = static_cast<std::uint16_t>(n - 8U);
-  if (ext_idx >= cb->overflow_cap_) {
+  if (ext_idx >= meta.overflow_cap) {
     const std::uint16_t new_cap =
-        cb->overflow_cap_ == 0U
+        meta.overflow_cap == 0U
             ? 16U
-            : static_cast<std::uint16_t>(cb->overflow_cap_ >= 4096U
+            : static_cast<std::uint16_t>(meta.overflow_cap >= 4096U
                                              ? kHspMaxCpus
-                                             : cb->overflow_cap_ * 4U);
+                                             : meta.overflow_cap * 4U);
     auto* next_buf = new (std::nothrow) std::uint16_t[new_cap];
     if (next_buf == nullptr) [[unlikely]] {
       return;
     }
-    if (cb->overflow_cpus_ != nullptr) {
-      std::memcpy(next_buf, cb->overflow_cpus_,
+    if (meta.overflow_cpus != nullptr) {
+      std::memcpy(next_buf, meta.overflow_cpus,
                   ext_idx * sizeof(std::uint16_t));
-      delete[] cb->overflow_cpus_;
+      delete[] meta.overflow_cpus;
     }
-    cb->overflow_cpus_ = next_buf;
-    cb->overflow_cap_ = new_cap;
+    meta.overflow_cpus = next_buf;
+    meta.overflow_cap = new_cap;
   }
-  cb->overflow_cpus_[ext_idx] = cpu;
-  cb->num_reg_cpus_ = static_cast<std::uint16_t>(n + 1U);
+  meta.overflow_cpus[ext_idx] = cpu;
+  meta.num_reg_cpus = static_cast<std::uint16_t>(n + 1U);
 }
 
-std::uint16_t get_reg_cpu_locked(const ThetaSpCountedBase* cb,
+std::uint16_t get_reg_cpu_locked(const PerCpuSlotMeta& meta,
                                  std::uint16_t i) noexcept {
   if (i < 8U) [[likely]] {
-    return cb->inline_cpus_[i];
+    return meta.inline_cpus[i];
   }
-  return cb->overflow_cpus_[i - 8U];
+  return meta.overflow_cpus[i - 8U];
 }
 
-bool try_register_cpu_cell_locked(ThetaSpCountedBase* cb, std::int32_t cpu,
+bool try_register_cpu_cell_locked(std::uint32_t slot, PerCpuSlotMeta& meta,
+                                  std::int32_t cpu,
                                   std::int64_t init_encoded) noexcept {
-  const std::uint32_t slot = cb->fast_.slot_id;
   std::int64_t* const cell =
       g_rseq_slab_base + (static_cast<std::size_t>(cpu) << kSlotShift) + slot;
   if (__atomic_load_n(cell, __ATOMIC_RELAXED) != 0) {
     return false;
   }
-  append_reg_cpu_locked(cb, static_cast<std::uint16_t>(cpu));
+  append_reg_cpu_locked(meta, static_cast<std::uint16_t>(cpu));
   __atomic_store_n(cell, init_encoded, __ATOMIC_RELEASE);
   return true;
 }
 
 // Single-Registered-CPU Quiescence Theorem: if zero CPUs or ONLY our currently
-// executing CPU ever registered on `cb`, any prior thread on our CPU was
+// executing CPU ever registered on `meta`, any prior thread on our CPU was
 // already `rseq`-aborted on context switch, so a local `seq_cst` fence after
 // `fast_active = 0` achieves global quiescence with 0 `SYS_membarrier` IPIs.
-void quiesce_rseq_for_cb_locked(const ThetaSpCountedBase* cb,
+void quiesce_rseq_for_cb_locked(const PerCpuSlotMeta* meta,
                                 bool count_toward_storm) noexcept {
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  const std::uint16_t n = cb->num_reg_cpus_;
+  if (meta == nullptr) {
+    return;
+  }
+  const std::uint16_t n = meta->num_reg_cpus;
   if (n == 0U) {
     return;
   }
   if (n == 1U) {
     const std::int32_t self_cpu = current_cpu_id();
-    if (cb->inline_cpus_[0] == static_cast<std::uint16_t>(self_cpu)) {
+    if (meta->inline_cpus[0] == static_cast<std::uint16_t>(self_cpu)) {
       std::atomic_signal_fence(std::memory_order_seq_cst);
       if (current_cpu_id() == self_cpu) {
         return;
@@ -465,7 +497,9 @@ void quiesce_rseq_for_cb_locked(const ThetaSpCountedBase* cb,
   broadcast_rseq_membarrier(count_toward_storm);
 }
 
-bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
+bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
+                              std::int64_t initial_tickets,
+                              std::int64_t first_delta,
                               bool force_keepalive) noexcept {
   ensure_runtime_init();
   if (!g_rseq_membarrier_ok || (!force_keepalive && in_membarrier_storm())) {
@@ -478,25 +512,17 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     return false;
   }
 
-  const std::int32_t u_refs = cb->unpromoted_theta_refs_;
-  cb->unpromoted_theta_refs_ = 0;
-
   cb->_M_weak_add_ref();
 
-  if (u_refs == 0) {
-    cb->_M_add_ref_copy();
-  } else if (u_refs > 1) {
-    for (std::int32_t i = 0; i < u_refs - 1; ++i) {
-      cb->_M_release();
-    }
-  }
-
-  cb->central_tickets_.store(static_cast<std::int64_t>(u_refs),
-                             std::memory_order_relaxed);
-  cb->fast_.slot_id = slot;
+  PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
+  meta.central_tickets.store(initial_tickets, std::memory_order_relaxed);
+  meta.last_harvest_ms = 0ULL;
+  meta.rapid_harvest_streak = 0U;
+  meta.num_reg_cpus = 0U;
+  __atomic_store_n(&cb->fast_.slot_id, slot, __ATOMIC_RELEASE);
 
   const std::int32_t cpu = current_cpu_id();
-  (void)try_register_cpu_cell_locked(cb, cpu, 1 + first_delta);
+  (void)try_register_cpu_cell_locked(slot, meta, cpu, 1 + first_delta);
 
   __atomic_store_n(&cb->fast_.mode, kModePerCpuActive, __ATOMIC_RELEASE);
   __atomic_store_n(&cb->fast_.fast_active, 1U, __ATOMIC_RELEASE);
@@ -506,9 +532,46 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
 }  // namespace
 
 [[gnu::aligned(64)]] void ThetaSpCountedBase::_M_dispose() noexcept {
-  if (dispose_fn_ != nullptr) {
-    dispose_fn_(this);
+  const std::uintptr_t tag = ops_or_size_;
+  if ((tag & 1U) != 0U) {
+    return;
   }
+  const auto* ops = reinterpret_cast<const SpColdOps*>(tag);
+  if (ops != nullptr && ops->dispose != nullptr) {
+    ops->dispose(this);
+  }
+}
+
+[[gnu::aligned(64)]] void ThetaSpCountedBase::_M_destroy() noexcept {
+  const std::uint32_t slot = __atomic_load_n(&fast_.slot_id, __ATOMIC_RELAXED);
+  if (slot != 0U) [[unlikely]] {
+    fast_.slot_id = 0U;
+    free_rseq_slot(slot);
+  }
+  const std::uintptr_t tag = ops_or_size_;
+  if ((tag & 1U) != 0U) {
+    ::operator delete(static_cast<void*>(this), tag >> 1U);
+    return;
+  }
+  const auto* ops = reinterpret_cast<const SpColdOps*>(tag);
+  if (ops != nullptr && ops->destroy != nullptr) {
+    ops->destroy(this);
+  } else {
+    ::operator delete(static_cast<void*>(this), sizeof(ThetaSpCountedBase));
+  }
+}
+
+[[gnu::aligned(64)]] void* ThetaSpCountedBase::_M_get_deleter(
+    const std::type_info& ti) noexcept {
+  const std::uintptr_t tag = ops_or_size_;
+  if ((tag & 1U) != 0U) {
+    return nullptr;
+  }
+  const auto* ops = reinterpret_cast<const SpColdOps*>(tag);
+  if (ops != nullptr && ops->get_deleter != nullptr) {
+    return ops->get_deleter(this, ti);
+  }
+  return nullptr;
 }
 
 [[gnu::aligned(64)]] void record_theta_sp_vptr(
@@ -559,7 +622,7 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
   lock_cb(cb);
   const std::uint8_t mode = cb->fast_.mode;
   if (mode == kModeUnpromoted) {
-    if (promote_to_percpu_locked(cb, /*first_delta=*/1,
+    if (promote_to_percpu_locked(cb, /*initial_tickets=*/1, /*first_delta=*/1,
                                  /*force_keepalive=*/false)) {
       unlock_cb(cb);
       return;
@@ -570,15 +633,17 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
   }
 
   if (mode == kModePerCpuActive) {
+    const std::uint32_t slot = cb->fast_.slot_id;
+    PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
     std::int64_t drained = 0;
     if (ArchBackend::try_rseq_drain_local_surplus(&cb->fast_, drained)) {
-      cb->central_tickets_.fetch_add(drained + 1, std::memory_order_release);
+      meta.central_tickets.fetch_add(drained + 1, std::memory_order_release);
       unlock_cb(cb);
       return;
     }
     const std::int32_t cpu = current_cpu_id();
-    if (!try_register_cpu_cell_locked(cb, cpu, /*init_encoded=*/2)) {
-      cb->central_tickets_.fetch_add(1, std::memory_order_relaxed);
+    if (!try_register_cpu_cell_locked(slot, meta, cpu, /*init_encoded=*/2)) {
+      meta.central_tickets.fetch_add(1, std::memory_order_relaxed);
     }
     unlock_cb(cb);
     return;
@@ -601,17 +666,21 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
   }
 
   // Lockless cross-CPU consumer fast path when `fast_active != 0` and
-  // `central_tickets_ >= 2` (fed in 64-item batches by producer
-  // `try_rseq_drain_local_surplus`, `0` `SYS_membarrier` IPIs!).
+  // `central_tickets >= 2` (ABA-safe via Slot Lifetime Exclusivity: `slot_id`
+  // is never recycled while any strong reference to `cb` remains).
   if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_ACQUIRE) != 0U)
       [[likely]] {
-    std::int64_t cur_tickets =
-        cb->central_tickets_.load(std::memory_order_relaxed);
-    while (cur_tickets >= 2) [[likely]] {
-      if (cb->central_tickets_.compare_exchange_weak(
-              cur_tickets, cur_tickets - 1, std::memory_order_acq_rel,
-              std::memory_order_relaxed)) [[likely]] {
-        return;
+    const std::uint32_t slot =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_ACQUIRE);
+    if (slot != 0U) [[likely]] {
+      auto& tickets = g_rseq_slot_meta[slot].central_tickets;
+      std::int64_t cur_tickets = tickets.load(std::memory_order_relaxed);
+      while (cur_tickets >= 2) [[likely]] {
+        if (tickets.compare_exchange_weak(
+                cur_tickets, cur_tickets - 1, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) [[likely]] {
+          return;
+        }
       }
     }
   }
@@ -625,27 +694,32 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
   }
 
   if (mode == kModeUnpromoted) {
-    --cb->unpromoted_theta_refs_;
+    // Reached only when `has_weak_or_std != 0` (e.g. a `WeakPtr` was formed).
+    // Transition to `kModeAtomicRetired` before unlocking so any concurrent
+    // `WeakPtr::lock()` arbitrates atomically on `_M_use_count`.
+    __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
     unlock_cb(cb);
     pi->_M_release();
     return;
   }
 
+  const std::uint32_t slot = cb->fast_.slot_id;
+  PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
+
   const std::int64_t rem =
-      cb->central_tickets_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+      meta.central_tickets.fetch_sub(1, std::memory_order_acq_rel) - 1;
   if (rem > 0) [[likely]] {
     unlock_cb(cb);
     return;
   }
 
   __atomic_store_n(&cb->fast_.fast_active, 0U, __ATOMIC_RELEASE);
-  quiesce_rseq_for_cb_locked(cb, /*count_toward_storm=*/true);
+  quiesce_rseq_for_cb_locked(&meta, /*count_toward_storm=*/true);
 
-  const std::uint32_t slot = cb->fast_.slot_id;
-  const std::uint16_t n_cpus = cb->num_reg_cpus_;
+  const std::uint16_t n_cpus = meta.num_reg_cpus;
   std::int64_t delta_sum = 0;
   for (std::uint16_t i = 0U; i < n_cpus; ++i) {
-    const std::uint16_t c = get_reg_cpu_locked(cb, i);
+    const std::uint16_t c = get_reg_cpu_locked(meta, i);
     std::int64_t* const cell =
         g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
     const std::int64_t v = __atomic_load_n(cell, __ATOMIC_ACQUIRE);
@@ -655,19 +729,27 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
   }
 
   const std::int64_t h_after = rem + delta_sum;
-  ++cb->harvest_count_;
+  const std::uint64_t now_ms = coarse_monotonic_ms();
+  if (meta.last_harvest_ms != 0ULL && (now_ms - meta.last_harvest_ms) <= 5ULL) {
+    ++meta.rapid_harvest_streak;
+  } else {
+    meta.rapid_harvest_streak = 1U;
+  }
+  meta.last_harvest_ms = (now_ms != 0ULL) ? now_ms : 1ULL;
 
   if (h_after == 0) {
     for (std::uint16_t i = 0U; i < n_cpus; ++i) {
-      const std::uint16_t c = get_reg_cpu_locked(cb, i);
+      const std::uint16_t c = get_reg_cpu_locked(meta, i);
       std::int64_t* const cell =
           g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
       __atomic_store_n(cell, 0, __ATOMIC_RELEASE);
     }
-    cb->num_reg_cpus_ = 0U;
-    cb->fast_.slot_id = 0U;
-    cb->central_tickets_.store(0, std::memory_order_relaxed);
-    free_rseq_slot(slot);
+    meta.num_reg_cpus = 0U;
+    meta.central_tickets.store(0, std::memory_order_relaxed);
+    if (__atomic_load_n(&cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) == 0U) {
+      __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+      free_rseq_slot(slot);
+    }
     __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
     unlock_cb(cb);
 
@@ -676,34 +758,32 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     return;
   }
 
-  // Retain Per-CPU Mode whenever `h_after >= 1` (e.g. a stationary `g_ptr`
-  // whose temporary worker handle migrated once across CPUs!) unless this
-  // specific object has exhausted `central_tickets_` repeatedly (`> 4` times,
-  // indicating sustained asymmetric unbuffered cross-CPU handoff) or the
-  // process is in a membarrier storm.
-  if (cb->harvest_count_ <= 4U && !in_membarrier_storm()) {
+  // Retain Per-CPU Mode whenever `h_after >= 1` unless this object suffers a
+  // sustained high-frequency harvest streak (`> 24` harvests spaced `<= 5 ms`
+  // apart, i.e. sustained unbuffered cross-CPU drain) or a global storm.
+  if (meta.rapid_harvest_streak <= 24U && !in_membarrier_storm()) {
     for (std::uint16_t i = 0U; i < n_cpus; ++i) {
-      const std::uint16_t c = get_reg_cpu_locked(cb, i);
+      const std::uint16_t c = get_reg_cpu_locked(meta, i);
       std::int64_t* const cell =
           g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
       __atomic_store_n(cell, 1, __ATOMIC_RELEASE);
     }
-    cb->central_tickets_.store(h_after, std::memory_order_relaxed);
+    meta.central_tickets.store(h_after, std::memory_order_relaxed);
     __atomic_store_n(&cb->fast_.fast_active, 1U, __ATOMIC_RELEASE);
     unlock_cb(cb);
     return;
   }
 
   for (std::uint16_t i = 0U; i < n_cpus; ++i) {
-    const std::uint16_t c = get_reg_cpu_locked(cb, i);
+    const std::uint16_t c = get_reg_cpu_locked(meta, i);
     std::int64_t* const cell =
         g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
     __atomic_store_n(cell, 0, __ATOMIC_RELEASE);
   }
-  cb->num_reg_cpus_ = 0U;
-  cb->fast_.slot_id = 0U;
-  cb->central_tickets_.store(0, std::memory_order_relaxed);
-  free_rseq_slot(slot);
+  meta.num_reg_cpus = 0U;
+  meta.central_tickets.store(0, std::memory_order_relaxed);
+  // Keep `cb->fast_.slot_id` bound until `_M_destroy()` so no racing reader of
+  // `slot_id` can ever observe ABA reuse while `cb` still has live references.
 
   for (std::int64_t i = 0; i < h_after - 1; ++i) {
     cb->_M_add_ref_copy();
@@ -730,15 +810,16 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     unlock_cb(cb);
     return cnt;
   }
+  const std::uint32_t slot = cb->fast_.slot_id;
+  const PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
   const long legacy_plus_lease = pi->_M_get_use_count();
   const long legacy_refs =
       legacy_plus_lease > 0L ? (legacy_plus_lease - 1L) : 0L;
   std::int64_t total =
-      legacy_refs + cb->central_tickets_.load(std::memory_order_relaxed);
-  const std::uint32_t slot = cb->fast_.slot_id;
-  const std::uint16_t n_cpus = cb->num_reg_cpus_;
+      legacy_refs + meta.central_tickets.load(std::memory_order_relaxed);
+  const std::uint16_t n_cpus = meta.num_reg_cpus;
   for (std::uint16_t i = 0U; i < n_cpus; ++i) {
-    const std::uint16_t c = get_reg_cpu_locked(cb, i);
+    const std::uint16_t c = get_reg_cpu_locked(meta, i);
     const std::int64_t* const cell =
         g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
     const std::int64_t v = __atomic_load_n(cell, __ATOMIC_RELAXED);
@@ -751,9 +832,20 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
 }
 
 [[gnu::aligned(64)]] void sp_note_to_std_copy(StdSpCountedBase* pi) noexcept {
-  if (is_theta_sp(pi)) {
-    auto* cb = static_cast<ThetaSpCountedBase*>(pi);
-    __atomic_store_n(&cb->has_weak_or_std_, 1U, __ATOMIC_RELEASE);
+  if (!is_theta_sp(pi)) {
+    pi->_M_add_ref_copy();
+    return;
+  }
+  auto* cb = static_cast<ThetaSpCountedBase*>(pi);
+  __atomic_store_n(&cb->fast_.has_weak_or_std, 1U, __ATOMIC_RELEASE);
+  if (__atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE) == kModeUnpromoted) {
+    lock_cb(cb);
+    if (cb->fast_.mode == kModeUnpromoted) {
+      (void)promote_to_percpu_locked(cb, /*initial_tickets=*/1,
+                                     /*first_delta=*/0,
+                                     /*force_keepalive=*/false);
+    }
+    unlock_cb(cb);
   }
   pi->_M_add_ref_copy();
 }
@@ -763,7 +855,7 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     return;
   }
   auto* cb = static_cast<ThetaSpCountedBase*>(pi);
-  __atomic_store_n(&cb->has_weak_or_std_, 1U, __ATOMIC_RELEASE);
+  __atomic_store_n(&cb->fast_.has_weak_or_std, 1U, __ATOMIC_RELEASE);
   if (__atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE) ==
       kModeAtomicRetired) {
     return;
@@ -775,7 +867,7 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     return;
   }
   if (mode == kModeUnpromoted) {
-    --cb->unpromoted_theta_refs_;
+    __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
     unlock_cb(cb);
     return;
   }
@@ -785,24 +877,6 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
 }
 
 [[gnu::aligned(64)]] void sp_add_ref_from_std(StdSpCountedBase* pi) noexcept {
-  if (!is_theta_sp(pi)) {
-    pi->_M_add_ref_copy();
-    return;
-  }
-  auto* cb = static_cast<ThetaSpCountedBase*>(pi);
-  if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U) {
-    sp_add_ref(pi);
-    return;
-  }
-  lock_cb(cb);
-  const std::uint8_t mode = cb->fast_.mode;
-  if (mode == kModeUnpromoted) {
-    ++cb->unpromoted_theta_refs_;
-    cb->_M_add_ref_copy();
-    unlock_cb(cb);
-    return;
-  }
-  unlock_cb(cb);
   sp_add_ref(pi);
 }
 
@@ -817,19 +891,14 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     return;
   }
   lock_cb(cb);
-  const std::uint8_t mode = cb->fast_.mode;
-  if (mode == kModeAtomicRetired) {
+  if (cb->fast_.mode == kModePerCpuActive) {
+    g_rseq_slot_meta[cb->fast_.slot_id].central_tickets.fetch_add(
+        1, std::memory_order_relaxed);
     unlock_cb(cb);
+    pi->_M_release();
     return;
   }
-  if (mode == kModeUnpromoted) {
-    ++cb->unpromoted_theta_refs_;
-    unlock_cb(cb);
-    return;
-  }
-  cb->central_tickets_.fetch_add(1, std::memory_order_relaxed);
   unlock_cb(cb);
-  pi->_M_release();
 }
 
 [[gnu::aligned(64)]] bool sp_weak_lock_slow(StdSpCountedBase* pi) noexcept {
@@ -844,31 +913,49 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
     return pi->_M_add_ref_lock_nothrow();
   }
   if (mode == kModeUnpromoted) {
-    if (pi->_M_add_ref_lock_nothrow()) {
-      ++cb->unpromoted_theta_refs_;
+    if (!pi->_M_add_ref_lock_nothrow()) {
       unlock_cb(cb);
-      return true;
+      return false;
+    }
+    if (promote_to_percpu_locked(cb, /*initial_tickets=*/2, /*first_delta=*/0,
+                                 /*force_keepalive=*/false)) {
+      cb->_M_release();
     }
     unlock_cb(cb);
-    return false;
+    return true;
   }
 
-  cb->central_tickets_.fetch_add(1, std::memory_order_relaxed);
+  g_rseq_slot_meta[cb->fast_.slot_id].central_tickets.fetch_add(
+      1, std::memory_order_relaxed);
   unlock_cb(cb);
   return true;
 }
 
-[[gnu::aligned(64)]] void sp_pin_for_keepalive(
-    ThetaSpCountedBase* cb) noexcept {
+[[gnu::aligned(64)]] bool sp_pin_for_keepalive(ThetaSpCountedBase* cb,
+                                               void* managed_ptr) noexcept {
   lock_cb(cb);
   if (cb->fast_.mode == kModeUnpromoted) {
-    (void)promote_to_percpu_locked(cb, /*first_delta=*/0,
+    (void)promote_to_percpu_locked(cb, /*initial_tickets=*/1, /*first_delta=*/0,
                                    /*force_keepalive=*/true);
   } else if (cb->fast_.mode == kModePerCpuActive) {
+    const std::uint32_t slot = cb->fast_.slot_id;
     const std::int32_t cpu = current_cpu_id();
-    (void)try_register_cpu_cell_locked(cb, cpu, /*init_encoded=*/1);
+    (void)try_register_cpu_cell_locked(slot, g_rseq_slot_meta[slot], cpu,
+                                       /*init_encoded=*/1);
+  }
+  if (cb->fast_.mode == kModePerCpuActive) {
+    const std::uint32_t slot = cb->fast_.slot_id;
+    void* existing =
+        __atomic_load_n(&g_rseq_keepalive_ptrs[slot], __ATOMIC_RELAXED);
+    if (existing != nullptr && existing != managed_ptr) [[unlikely]] {
+      unlock_cb(cb);
+      return false;
+    }
+    __atomic_store_n(&g_rseq_keepalive_ptrs[slot], managed_ptr,
+                     __ATOMIC_RELEASE);
   }
   unlock_cb(cb);
+  return true;
 }
 
 [[gnu::aligned(64)]] void sp_register_keepalive_cpu_slow(
@@ -878,8 +965,10 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
   }
   lock_cb(cb);
   if (cb->fast_.mode == kModePerCpuActive) {
+    const std::uint32_t slot = cb->fast_.slot_id;
     const std::int32_t cpu = current_cpu_id();
-    (void)try_register_cpu_cell_locked(cb, cpu, /*init_encoded=*/1);
+    (void)try_register_cpu_cell_locked(slot, g_rseq_slot_meta[slot], cpu,
+                                       /*init_encoded=*/1);
   }
   unlock_cb(cb);
 }
@@ -887,7 +976,11 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb, std::int64_t first_delta,
 [[gnu::aligned(64)]] void sp_keepalive_retire_old(
     ThetaSpCountedBase* old_cb) noexcept {
   lock_cb(old_cb);
-  quiesce_rseq_for_cb_locked(old_cb, /*count_toward_storm=*/false);
+  const std::uint32_t slot = old_cb->fast_.slot_id;
+  const PerCpuSlotMeta* meta = (slot != 0U && g_rseq_slot_meta != nullptr)
+                                   ? &g_rseq_slot_meta[slot]
+                                   : nullptr;
+  quiesce_rseq_for_cb_locked(meta, /*count_toward_storm=*/false);
   unlock_cb(old_cb);
 }
 

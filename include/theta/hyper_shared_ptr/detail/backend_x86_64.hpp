@@ -142,8 +142,8 @@ struct ArchBackend {
   // `KeepAlive::reset()` concurrently, its `MEMBARRIER_RSEQ` aborts any reader
   // between loading `*cb_slot` and committing `slab[cpu][slot] + 1`.
   static THETA_FORCE_INLINE bool try_rseq_keepalive_acquire(
-      ThetaSpCountedBase* const* cb_slot,
-      ThetaSpCountedBase*& out_cb) noexcept {
+      ThetaSpCountedBase* const* cb_slot, ThetaSpCountedBase*& out_cb,
+      std::uint32_t& out_slot) noexcept {
     const std::ptrdiff_t rseq_off = __rseq_offset;
     std::int64_t* const base = g_rseq_slab_base;
     if (base == nullptr) [[unlikely]] {
@@ -195,9 +195,11 @@ struct ArchBackend {
         : "memory", "cc"
         : null_done, slow_ka);
     out_cb = cb;
+    out_slot = static_cast<std::uint32_t>(slot);
     return true;
   null_done:
     out_cb = nullptr;
+    out_slot = 0U;
     return true;
   slow_ka:
     return false;

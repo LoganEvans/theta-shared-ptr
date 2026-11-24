@@ -71,8 +71,8 @@ struct ArchBackend {
   }
 
   static THETA_FORCE_INLINE bool try_rseq_keepalive_acquire(
-      ThetaSpCountedBase* const* /*cb_slot*/,
-      ThetaSpCountedBase*& /*out_cb*/) noexcept {
+      ThetaSpCountedBase* const* /*cb_slot*/, ThetaSpCountedBase*& /*out_cb*/,
+      std::uint32_t& /*out_slot*/) noexcept {
     return false;
   }
 

@@ -131,8 +131,8 @@ struct ArchBackend {
   }
 
   static THETA_FORCE_INLINE bool try_rseq_keepalive_acquire(
-      ThetaSpCountedBase* const* cb_slot,
-      ThetaSpCountedBase*& out_cb) noexcept {
+      ThetaSpCountedBase* const* cb_slot, ThetaSpCountedBase*& out_cb,
+      std::uint32_t& out_slot) noexcept {
     const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
     const char* const rseq_base = tp + __rseq_offset;
     std::int64_t* const base = g_rseq_slab_base;
@@ -184,9 +184,11 @@ struct ArchBackend {
         : "memory", "cc"
         : null_done_arm, slow_ka_arm);
     out_cb = cb;
+    out_slot = static_cast<std::uint32_t>(slot);
     return true;
   null_done_arm:
     out_cb = nullptr;
+    out_slot = 0U;
     return true;
   slow_ka_arm:
     return false;

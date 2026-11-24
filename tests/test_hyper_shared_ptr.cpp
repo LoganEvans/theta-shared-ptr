@@ -473,5 +473,33 @@ TEST(ConcurrencyStressTest, KeepAliveConcurrentReadersAndResets) {
   EXPECT_EQ(TrackedBase::dtors.load(), 150);
 }
 
+struct alignas(128) OverAlignedPayload {
+  std::uint64_t a{0};
+  std::uint64_t b{0};
+};
+
+TEST(SharedPtrSemanticsTest, OverAlignedAndAliasedKeepAlive) {
+  {
+    auto over =
+        make_shared<OverAlignedPayload>(OverAlignedPayload{11ULL, 22ULL});
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(over.get()) % 128U, 0U);
+    EXPECT_EQ(over->a, 11ULL);
+    EXPECT_EQ(over->b, 22ULL);
+  }
+  {
+    struct PairObj {
+      int first{101};
+      int second{202};
+    };
+    auto root = make_shared<PairObj>();
+    SharedPtr<int> a1(root, &root->first);
+    SharedPtr<int> a2(root, &root->second);
+    KeepAlive<int> ka1(a1);
+    KeepAlive<int> ka2(a2);
+    EXPECT_EQ(*ka1.get(), 101);
+    EXPECT_EQ(*ka2.get(), 202);
+  }
+}
+
 }  // namespace
 }  // namespace theta
