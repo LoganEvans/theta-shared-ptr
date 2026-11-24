@@ -55,11 +55,10 @@ struct ArchBackend {
         "shlq %[shift], %[idx]\n\t"
         "addq %[slot], %[idx]\n\t"
         "movq (%[base], %[idx], 8), %[val]\n\t"
-        "testq %[val], %[val]\n\t"
-        "jz %l[slow_inc]\n\t"
-        "cmpq $33, %[val]\n\t"
+        "decq %[val]\n\t"
+        "cmpq $32, %[val]\n\t"
         "jae %l[slow_inc]\n\t"
-        "incq %[val]\n\t"
+        "addq $2, %[val]\n\t"
         "movq %[val], (%[base], %[idx], 8)\n\t"
         "3:\n\t"
         ".pushsection .text.unlikely, \"ax?\"\n\t"
@@ -170,9 +169,10 @@ struct ArchBackend {
         "shlq %[shift], %[idx]\n\t"
         "addq %[slot], %[idx]\n\t"
         "movq (%[base], %[idx], 8), %[val]\n\t"
-        "testq %[val], %[val]\n\t"
-        "jz %l[slow_ka]\n\t"
-        "incq %[val]\n\t"
+        "decq %[val]\n\t"
+        "cmpq $32, %[val]\n\t"
+        "jae %l[slow_ka]\n\t"
+        "addq $2, %[val]\n\t"
         "movq %[val], (%[base], %[idx], 8)\n\t"
         "3:\n\t"
         ".pushsection .text.unlikely, \"ax?\"\n\t"
@@ -193,6 +193,77 @@ struct ArchBackend {
     out_slot = 0U;
     return true;
   slow_ka:
+    return false;
+  }
+
+  // Wait-free `std::atomic<SharedPtr<T>>::load()` fast path inside one `rseq`
+  // critical section (`0` `LOCK`, `0` spinlock writes). `rep_slot` holds `0`
+  // (`nullptr`), a low-3-bit tagged state (`Locked` / `Unpinned` / `NoPin`), or
+  // an 8-byte-aligned `ThetaSpCountedBase*` pinned in `g_rseq_keepalive_ptrs`.
+  static THETA_FORCE_INLINE bool try_rseq_atomic_load(
+      const std::uintptr_t* rep_slot, ThetaSpCountedBase*& out_cb,
+      std::uint32_t& out_slot) noexcept {
+    const std::ptrdiff_t rseq_off = __rseq_offset;
+    std::int64_t* const base = g_rseq_slab_base;
+    if (base == nullptr) [[unlikely]] {
+      return false;
+    }
+    ThetaSpCountedBase* cb;
+    std::uint64_t idx;
+    std::uint64_t slot;
+    std::uint64_t val;
+
+    // WHY ASM: (a) OS/ABI control-flow contract — atomic tagged-pointer load +
+    // per-CPU counter increment inside one Linux `rseq` `[2f, 3f)` transaction.
+    asm volatile goto(
+        ".pushsection __rseq_cs, \"aw?\"\n\t"
+        ".balign 32\n\t"
+        "1:\n\t"
+        ".long 0, 0\n\t"
+        ".quad 2f, (3f - 2f), 4f\n\t"
+        ".popsection\n\t"
+        "6:\n\t"
+        "leaq 1b(%%rip), %[idx]\n\t"
+        "movq %[idx], %%fs:8(%[rseq_off])\n\t"
+        "2:\n\t"
+        "movq (%[rep_slot]), %[cb]\n\t"
+        "testq %[cb], %[cb]\n\t"
+        "jz %l[null_atomic]\n\t"
+        "testb $7, %b[cb]\n\t"
+        "jnz %l[slow_atomic]\n\t"
+        "cmpb $0, 20(%[cb])\n\t"
+        "je %l[slow_atomic]\n\t"
+        "movl %%fs:4(%[rseq_off]), %k[idx]\n\t"
+        "cmpl %[max_cpus], %k[idx]\n\t"
+        "jae %l[slow_atomic]\n\t"
+        "movl 16(%[cb]), %k[slot]\n\t"
+        "shlq %[shift], %[idx]\n\t"
+        "addq %[slot], %[idx]\n\t"
+        "movq (%[base], %[idx], 8), %[val]\n\t"
+        "decq %[val]\n\t"
+        "cmpq $32, %[val]\n\t"
+        "jae %l[slow_atomic]\n\t"
+        "addq $2, %[val]\n\t"
+        "movq %[val], (%[base], %[idx], 8)\n\t"
+        "3:\n\t"
+        ".pushsection .text.unlikely, \"ax?\"\n\t"
+        ".long 0x53053053\n\t"
+        "4:\n\t"
+        "jmp 6b\n\t"
+        ".popsection\n\t"
+        : [cb] "=&r"(cb), [idx] "=&r"(idx), [slot] "=&r"(slot), [val] "=&r"(val)
+        : [rseq_off] "r"(rseq_off), [rep_slot] "r"(rep_slot), [base] "r"(base),
+          [max_cpus] "i"(kSharedPtrMaxCpus), [shift] "i"(kSlotShift)
+        : "memory", "cc"
+        : null_atomic, slow_atomic);
+    out_cb = cb;
+    out_slot = static_cast<std::uint32_t>(slot);
+    return true;
+  null_atomic:
+    out_cb = nullptr;
+    out_slot = 0U;
+    return true;
+  slow_atomic:
     return false;
   }
 

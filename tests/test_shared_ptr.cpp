@@ -802,5 +802,101 @@ TEST(SharedPtrSemanticsTest, WarmupLifecycleInteropAndCrossCpuChurn) {
   EXPECT_EQ(TrackedBase::live.load(), 0);
 }
 
+TEST(ConcurrencyStressTest, StdAtomicSharedPtrRseqPinningAliasingAndReloads) {
+  TrackedBase::reset_counts();
+
+  // 1. Empty, empty-owner aliasing, shared-owner aliasing, and nullptr+deleter
+  {
+    std::atomic<SharedPtr<int>> empty_cell;
+    EXPECT_EQ(empty_cell.load().get(), nullptr);
+
+    int static_val = 4242;
+    SharedPtr<int> empty_owner_alias(SharedPtr<int>{}, &static_val);
+    empty_cell.store(empty_owner_alias);
+    for (int i = 0; i < 128; ++i) {
+      auto got = empty_cell.load();
+      ASSERT_EQ(got.get(), &static_val);
+      EXPECT_EQ(*got, 4242);
+      EXPECT_EQ(got.use_count(), 0L);
+    }
+
+    bool null_del_ran = false;
+    SharedPtr<int> null_with_del(nullptr, [&](int*) { null_del_ran = true; });
+    empty_cell.store(std::move(null_with_del));
+    for (int i = 0; i < 128; ++i) {
+      auto got = empty_cell.load();
+      EXPECT_EQ(got.get(), nullptr);
+      EXPECT_GE(got.use_count(), 2L);
+    }
+    empty_cell.store(nullptr);
+    EXPECT_TRUE(null_del_ran);
+
+    struct Pair {
+      int a{111};
+      int b{222};
+    };
+    auto root = make_shared<Pair>();
+    std::atomic<SharedPtr<int>> c1(SharedPtr<int>(root, &root->a));
+    std::atomic<SharedPtr<int>> c2(SharedPtr<int>(root, &root->b));
+    root.reset();
+    for (int i = 0; i < 600; ++i) {
+      ASSERT_EQ(*c1.load(), 111);
+      ASSERT_EQ(*c2.load(), 222);
+    }
+  }
+
+  // 2. Concurrent hot `rseq` readers + periodic `store` / `exchange` / `CAS`
+  {
+    std::atomic<SharedPtr<TrackedBase>> hot_cell(make_shared<TrackedBase>(1));
+    // Warm past `atomic_pin_reads` threshold so readers exercise pinned `rseq`
+    for (int i = 0; i < 600; ++i) {
+      ASSERT_EQ(hot_cell.load()->base_val, 1);
+    }
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 6; ++t) {
+      readers.emplace_back([&]() {
+        unsigned int iters = 0U;
+        while (!stop.load(std::memory_order_relaxed)) {
+          auto snap = hot_cell.load(std::memory_order_acquire);
+          if (snap) {
+            ASSERT_GE(snap->base_val, 1);
+          }
+          if constexpr (arch::kTsanEnabled) {
+            if ((++iters & 15U) == 0U) {
+              std::this_thread::yield();
+            }
+          }
+        }
+      });
+    }
+
+    for (int gen = 2; gen <= 120; ++gen) {
+      auto next = make_shared<TrackedBase>(gen);
+      if ((gen & 1) == 0) {
+        hot_cell.store(std::move(next), std::memory_order_seq_cst);
+      } else {
+        auto prev =
+            hot_cell.exchange(std::move(next), std::memory_order_acq_rel);
+        ASSERT_NE(prev.get(), nullptr);
+      }
+      for (int r = 0; r < 80; ++r) {
+        auto snap = hot_cell.load(std::memory_order_acquire);
+        ASSERT_GE(snap->base_val, gen);
+      }
+    }
+    hot_cell.store(nullptr);
+
+    stop.store(true, std::memory_order_release);
+    for (auto& th : readers) {
+      th.join();
+    }
+  }
+
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+  EXPECT_EQ(TrackedBase::dtors.load(), 120);
+}
+
 }  // namespace
 }  // namespace theta

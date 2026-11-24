@@ -57,7 +57,7 @@ inline constexpr std::uint32_t kPromotionWarmupCopies = 8U;
 // inline `rseq` assembly accesses `slot_id` (+0) and `fast_active` (+4) with
 // compile-time `offsetof` verification, while `ThetaSpCountedBase` itself fits
 // in 32 bytes (`40B` total with an inplace `uint64_t`).
-struct SpFastHeader {
+struct alignas(8) SpFastHeader {
   std::uint32_t slot_id{0};
   std::uint8_t fast_active{0};
   std::uint8_t mode{kModeUnpromoted};
@@ -67,6 +67,7 @@ struct SpFastHeader {
 
 static_assert(std::is_standard_layout_v<SpFastHeader>);
 static_assert(sizeof(SpFastHeader) == 8);
+static_assert(alignof(SpFastHeader) == 8);
 static_assert(offsetof(SpFastHeader, slot_id) == 0);
 static_assert(offsetof(SpFastHeader, fast_active) == 4);
 static_assert(offsetof(SpFastHeader, mode) == 5);
@@ -149,8 +150,13 @@ struct alignas(8) SpColdOps {
 // object is promoted.
 class ThetaSpCountedBase final : public StdSpCountedBase {
  public:
-  explicit ThetaSpCountedBase(std::uintptr_t ops_or_size) noexcept
-      : ops_or_size_(ops_or_size) {
+  explicit ThetaSpCountedBase(std::uintptr_t ops_or_size) noexcept {
+    // Emit two scalar 64-bit GPR stores (`stp xzr, xN, [x0, #16]` on AArch64;
+    // two `movq` stores on x86-64) rather than allowing LLVM's SLP vectorizer
+    // to fuse `fast_` + `ops_or_size_` into a 128-bit NEON `str q0` that stalls
+    // STLF against GPR loads in `sp_release()`.
+    std::atomic_signal_fence(std::memory_order_relaxed);
+    ops_or_size_ = ops_or_size;
 #if !(defined(__GXX_ABI_VERSION) && !THETA_ASAN_ENABLED)
     if (__atomic_load_n(&g_theta_sp_vptr, __ATOMIC_RELAXED) == nullptr)
         [[unlikely]] {
@@ -199,11 +205,16 @@ void sp_add_ref_from_std(StdSpCountedBase* pi) noexcept;
 void sp_adopt_from_std_move(StdSpCountedBase* pi) noexcept;
 [[nodiscard]] bool sp_weak_lock_slow(StdSpCountedBase* pi) noexcept;
 
-// KeepAlive support on `ThetaSpCountedBase`
+// KeepAlive & `rseq`-accelerated `std::atomic<SharedPtr<T>>` support on
+// `ThetaSpCountedBase`
 [[nodiscard]] bool sp_pin_for_keepalive(ThetaSpCountedBase* cb,
                                         void* managed_ptr) noexcept;
+[[nodiscard]] bool sp_try_pin_atomic_fast(ThetaSpCountedBase* cb,
+                                          void* managed_ptr,
+                                          bool& out_never_pin) noexcept;
 void sp_register_keepalive_cpu_slow(ThetaSpCountedBase* cb) noexcept;
-void sp_keepalive_retire_old(ThetaSpCountedBase* old_cb) noexcept;
+void sp_unpin_and_retire_old(ThetaSpCountedBase* old_cb, bool drop_anchor_ref,
+                             bool quiesce_readers) noexcept;
 
 // Striped spinlock + futex wait/notify table for `std::atomic<SharedPtr<T>>`
 // and `std::atomic<WeakPtr<T>>` (keeps `sizeof(atomic<SharedPtr<T>>) == 16`).

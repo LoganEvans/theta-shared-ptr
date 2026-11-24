@@ -4,6 +4,7 @@
 
 #include <pthread.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -36,12 +37,19 @@ constinit void** g_rseq_keepalive_ptrs = nullptr;
 
 namespace {
 
+inline constexpr std::int64_t kPinnedTicketCushion = 1024;
+inline constexpr std::uint32_t kAtomicPinWarmupReads = 8U;
+
 struct alignas(64) PerCpuSlotMeta {
   std::atomic<std::int64_t> central_tickets{0};
   std::uint64_t last_harvest_ms{0};
   std::uint32_t rapid_harvest_streak{0};
-  std::uint16_t num_reg_cpus{0};
-  std::uint16_t overflow_cap{0};
+  std::uint32_t num_reg_cpus{0};
+  std::uint32_t overflow_cap{0};
+  std::uint32_t pin_count{0};
+  std::atomic<std::uint32_t> atomic_pin_reads{0};
+  std::uint8_t keepalive_ptr_set{0};
+  std::uint8_t pad_[3]{};
   std::uint16_t inline_cpus[8]{};
   std::uint16_t* overflow_cpus{nullptr};
 };
@@ -383,20 +391,20 @@ THETA_FORCE_INLINE void unlock_cb(ThetaSpCountedBase* cb) noexcept {
 }
 
 void append_reg_cpu_locked(PerCpuSlotMeta& meta, std::uint16_t cpu) noexcept {
-  const std::uint16_t n = meta.num_reg_cpus;
+  const std::uint32_t n = meta.num_reg_cpus;
   if (n < 8U) [[likely]] {
     meta.inline_cpus[n] = cpu;
-    meta.num_reg_cpus = static_cast<std::uint16_t>(n + 1U);
+    meta.num_reg_cpus = n + 1U;
     return;
   }
-  const std::uint16_t ext_idx = static_cast<std::uint16_t>(n - 8U);
+  const std::uint32_t ext_idx = n - 8U;
   if (ext_idx >= meta.overflow_cap) {
-    const std::uint16_t new_cap =
+    const std::uint32_t new_cap =
         meta.overflow_cap == 0U
             ? 16U
-            : static_cast<std::uint16_t>(meta.overflow_cap >= 4096U
-                                             ? kSharedPtrMaxCpus
-                                             : meta.overflow_cap * 4U);
+            : (meta.overflow_cap >= 4096U
+                   ? static_cast<std::uint32_t>(kSharedPtrMaxCpus)
+                   : meta.overflow_cap * 4U);
     auto* next_buf = new (std::nothrow) std::uint16_t[new_cap];
     if (next_buf == nullptr) [[unlikely]] {
       return;
@@ -410,11 +418,11 @@ void append_reg_cpu_locked(PerCpuSlotMeta& meta, std::uint16_t cpu) noexcept {
     meta.overflow_cap = new_cap;
   }
   meta.overflow_cpus[ext_idx] = cpu;
-  meta.num_reg_cpus = static_cast<std::uint16_t>(n + 1U);
+  meta.num_reg_cpus = n + 1U;
 }
 
 std::uint16_t get_reg_cpu_locked(const PerCpuSlotMeta& meta,
-                                 std::uint16_t i) noexcept {
+                                 std::uint32_t i) noexcept {
   if (i < 8U) [[likely]] {
     return meta.inline_cpus[i];
   }
@@ -444,7 +452,7 @@ void quiesce_rseq_for_cb_locked(const PerCpuSlotMeta* meta,
   if (meta == nullptr) {
     return;
   }
-  const std::uint16_t n = meta->num_reg_cpus;
+  const std::uint32_t n = meta->num_reg_cpus;
   if (n == 0U) {
     return;
   }
@@ -482,6 +490,9 @@ bool promote_to_percpu_locked(ThetaSpCountedBase* cb,
   meta.last_harvest_ms = 0ULL;
   meta.rapid_harvest_streak = 0U;
   meta.num_reg_cpus = 0U;
+  meta.pin_count = 0U;
+  meta.atomic_pin_reads.store(0U, std::memory_order_relaxed);
+  meta.keepalive_ptr_set = 0U;
   __atomic_store_n(&cb->fast_.slot_id, slot, __ATOMIC_RELEASE);
 
   const std::int32_t cpu = current_cpu_id();
@@ -625,8 +636,10 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
         __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
     const std::uint32_t refs = packed & 0xFFFFU;
     const std::uint32_t copies = (packed >> 16U) + 1U;
-    if (copies < kPromotionWarmupCopies && refs < 0xFFFEU) [[likely]] {
-      __atomic_store_n(&cb->fast_.slot_id, (copies << 16U) | (refs + 1U),
+    if ((copies < kPromotionWarmupCopies || in_membarrier_storm()) &&
+        refs < 0xFFFEU) [[likely]] {
+      const std::uint32_t capped = copies <= 0xFFFFU ? copies : 0xFFFFU;
+      __atomic_store_n(&cb->fast_.slot_id, (capped << 16U) | (refs + 1U),
                        __ATOMIC_RELAXED);
       unlock_cb(cb);
       return;
@@ -755,11 +768,14 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   }
 
   __atomic_store_n(&cb->fast_.fast_active, 0U, __ATOMIC_RELEASE);
-  quiesce_rseq_for_cb_locked(&meta, /*count_toward_storm=*/true);
+  quiesce_rseq_for_cb_locked(
+      &meta,
+      /*count_toward_storm=*/(meta.keepalive_ptr_set == 0U));
 
-  const std::uint16_t n_cpus = meta.num_reg_cpus;
+  const std::uint32_t n_cpus = meta.num_reg_cpus;
   std::int64_t delta_sum = 0;
-  for (std::uint16_t i = 0U; i < n_cpus; ++i) {
+#pragma clang loop vectorize(disable) unroll(disable)
+  for (std::uint32_t i = 0U; i < n_cpus; ++i) {
     const std::uint16_t c = get_reg_cpu_locked(meta, i);
     std::int64_t* const cell =
         g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
@@ -771,7 +787,7 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
 
   const std::int64_t h_after = rem + delta_sum;
   const std::uint64_t now_ms = coarse_monotonic_ms();
-  if (meta.last_harvest_ms != 0ULL && (now_ms - meta.last_harvest_ms) <= 5ULL) {
+  if (meta.last_harvest_ms != 0ULL && now_ms == meta.last_harvest_ms) {
     ++meta.rapid_harvest_streak;
   } else {
     meta.rapid_harvest_streak = 1U;
@@ -779,7 +795,8 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   meta.last_harvest_ms = (now_ms != 0ULL) ? now_ms : 1ULL;
 
   if (h_after == 0) {
-    for (std::uint16_t i = 0U; i < n_cpus; ++i) {
+#pragma clang loop vectorize(disable) unroll(disable)
+    for (std::uint32_t i = 0U; i < n_cpus; ++i) {
       const std::uint16_t c = get_reg_cpu_locked(meta, i);
       std::int64_t* const cell =
           g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
@@ -799,11 +816,13 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     return;
   }
 
-  // Retain Per-CPU Mode whenever `h_after >= 1` unless this object suffers a
-  // sustained high-frequency harvest streak (`> 24` harvests spaced `<= 5 ms`
-  // apart, i.e. sustained unbuffered cross-CPU drain) or a global storm.
-  if (meta.rapid_harvest_streak <= 24U && !in_membarrier_storm()) {
-    for (std::uint16_t i = 0U; i < n_cpus; ++i) {
+  // Retain Per-CPU Mode whenever `h_after >= 1` unless an unpinned object
+  // suffers a sub-millisecond harvest storm (`> 64` harvests within one `1 ms`
+  // coarse tick) or a global storm.
+  if (meta.pin_count > 0U ||
+      (meta.rapid_harvest_streak <= 64U && !in_membarrier_storm())) {
+#pragma clang loop vectorize(disable) unroll(disable)
+    for (std::uint32_t i = 0U; i < n_cpus; ++i) {
       const std::uint16_t c = get_reg_cpu_locked(meta, i);
       std::int64_t* const cell =
           g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
@@ -815,7 +834,8 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     return;
   }
 
-  for (std::uint16_t i = 0U; i < n_cpus; ++i) {
+#pragma clang loop vectorize(disable) unroll(disable)
+  for (std::uint32_t i = 0U; i < n_cpus; ++i) {
     const std::uint16_t c = get_reg_cpu_locked(meta, i);
     std::int64_t* const cell =
         g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
@@ -863,10 +883,12 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   const long legacy_plus_lease = pi->_M_get_use_count();
   const long legacy_refs =
       legacy_plus_lease > 0L ? (legacy_plus_lease - 1L) : 0L;
-  std::int64_t total =
-      legacy_refs + meta.central_tickets.load(std::memory_order_relaxed);
-  const std::uint16_t n_cpus = meta.num_reg_cpus;
-  for (std::uint16_t i = 0U; i < n_cpus; ++i) {
+  std::int64_t total = legacy_refs +
+                       meta.central_tickets.load(std::memory_order_relaxed) -
+                       (meta.pin_count > 0U ? kPinnedTicketCushion : 0);
+  const std::uint32_t n_cpus = meta.num_reg_cpus;
+#pragma clang loop vectorize(disable) unroll(disable)
+  for (std::uint32_t i = 0U; i < n_cpus; ++i) {
     const std::uint16_t c = get_reg_cpu_locked(meta, i);
     const std::int64_t* const cell =
         g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
@@ -1070,15 +1092,68 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   }
   if (cb->fast_.mode == kModePerCpuActive) {
     const std::uint32_t slot = cb->fast_.slot_id;
+    PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
     void* existing =
         __atomic_load_n(&g_rseq_keepalive_ptrs[slot], __ATOMIC_RELAXED);
-    if (existing != nullptr && existing != managed_ptr) [[unlikely]] {
+    if (meta.keepalive_ptr_set != 0U && existing != managed_ptr) [[unlikely]] {
       unlock_cb(cb);
       return false;
     }
     __atomic_store_n(&g_rseq_keepalive_ptrs[slot], managed_ptr,
                      __ATOMIC_RELEASE);
+    meta.keepalive_ptr_set = 1U;
+    if (meta.pin_count == 0U) {
+      meta.central_tickets.fetch_add(kPinnedTicketCushion,
+                                     std::memory_order_relaxed);
+    }
+    ++meta.pin_count;
   }
+  unlock_cb(cb);
+  return true;
+}
+
+[[gnu::aligned(64)]] bool sp_try_pin_atomic_fast(ThetaSpCountedBase* cb,
+                                                 void* managed_ptr,
+                                                 bool& out_never_pin) noexcept {
+  out_never_pin = false;
+  if (managed_ptr == nullptr || in_membarrier_storm()) [[unlikely]] {
+    return false;
+  }
+  const std::uint32_t slot =
+      __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_ACQUIRE);
+  if (slot == 0U || g_rseq_slot_meta == nullptr) [[unlikely]] {
+    return false;
+  }
+  const std::uint32_t reads = g_rseq_slot_meta[slot].atomic_pin_reads.fetch_add(
+                                  1U, std::memory_order_relaxed) +
+                              1U;
+  if (reads < kAtomicPinWarmupReads) {
+    return false;
+  }
+
+  lock_cb(cb);
+  if (cb->fast_.mode != kModePerCpuActive || cb->fast_.slot_id != slot) {
+    unlock_cb(cb);
+    out_never_pin = (cb->fast_.mode == kModeAtomicRetired);
+    return false;
+  }
+  PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
+  void* existing =
+      __atomic_load_n(&g_rseq_keepalive_ptrs[slot], __ATOMIC_RELAXED);
+  if (meta.keepalive_ptr_set != 0U && existing != managed_ptr) [[unlikely]] {
+    unlock_cb(cb);
+    out_never_pin = true;
+    return false;
+  }
+  __atomic_store_n(&g_rseq_keepalive_ptrs[slot], managed_ptr, __ATOMIC_RELEASE);
+  meta.keepalive_ptr_set = 1U;
+  if (meta.pin_count == 0U) {
+    meta.central_tickets.fetch_add(kPinnedTicketCushion,
+                                   std::memory_order_relaxed);
+  }
+  ++meta.pin_count;
+  const std::int32_t cpu = current_cpu_id();
+  (void)try_register_cpu_cell_locked(slot, meta, cpu, /*init_encoded=*/1);
   unlock_cb(cb);
   return true;
 }
@@ -1098,14 +1173,92 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   unlock_cb(cb);
 }
 
-[[gnu::aligned(64)]] void sp_keepalive_retire_old(
-    ThetaSpCountedBase* old_cb) noexcept {
+[[gnu::aligned(64)]] void sp_unpin_and_retire_old(
+    ThetaSpCountedBase* old_cb, bool drop_anchor_ref,
+    bool quiesce_readers) noexcept {
   lock_cb(old_cb);
+  if (old_cb->fast_.mode != kModePerCpuActive) {
+    unlock_cb(old_cb);
+    if (drop_anchor_ref) {
+      sp_release(old_cb);
+    }
+    return;
+  }
+
   const std::uint32_t slot = old_cb->fast_.slot_id;
-  const PerCpuSlotMeta* meta = (slot != 0U && g_rseq_slot_meta != nullptr)
-                                   ? &g_rseq_slot_meta[slot]
-                                   : nullptr;
-  quiesce_rseq_for_cb_locked(meta, /*count_toward_storm=*/false);
+  PerCpuSlotMeta& meta = g_rseq_slot_meta[slot];
+
+  std::int64_t sub = drop_anchor_ref ? 1 : 0;
+  if (meta.pin_count > 0U) {
+    --meta.pin_count;
+    if (meta.pin_count == 0U) {
+      sub += kPinnedTicketCushion;
+    }
+  }
+
+  const std::int64_t rem =
+      (sub != 0)
+          ? (meta.central_tickets.fetch_sub(sub, std::memory_order_acq_rel) -
+             sub)
+          : meta.central_tickets.load(std::memory_order_acquire);
+
+  if (rem > 0) {
+    if (quiesce_readers) {
+      quiesce_rseq_for_cb_locked(&meta, /*count_toward_storm=*/false);
+    }
+    unlock_cb(old_cb);
+    return;
+  }
+
+  __atomic_store_n(&old_cb->fast_.fast_active, 0U, __ATOMIC_RELEASE);
+  quiesce_rseq_for_cb_locked(&meta, /*count_toward_storm=*/false);
+
+  const std::uint32_t n_cpus = meta.num_reg_cpus;
+  std::int64_t delta_sum = 0;
+#pragma clang loop vectorize(disable) unroll(disable)
+  for (std::uint32_t i = 0U; i < n_cpus; ++i) {
+    const std::uint16_t c = get_reg_cpu_locked(meta, i);
+    std::int64_t* const cell =
+        g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
+    const std::int64_t v = __atomic_load_n(cell, __ATOMIC_ACQUIRE);
+    if (v >= 1) {
+      delta_sum += (v - 1);
+    }
+  }
+
+  const std::int64_t h_after = rem + delta_sum;
+  if (h_after <= 0) {
+#pragma clang loop vectorize(disable) unroll(disable)
+    for (std::uint32_t i = 0U; i < n_cpus; ++i) {
+      const std::uint16_t c = get_reg_cpu_locked(meta, i);
+      std::int64_t* const cell =
+          g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
+      __atomic_store_n(cell, 0, __ATOMIC_RELEASE);
+    }
+    meta.num_reg_cpus = 0U;
+    meta.central_tickets.store(0, std::memory_order_relaxed);
+    if (__atomic_load_n(&old_cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) ==
+        0U) {
+      __atomic_store_n(&old_cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+      free_rseq_slot(slot);
+    }
+    __atomic_store_n(&old_cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
+    unlock_cb(old_cb);
+
+    old_cb->_M_weak_release();
+    old_cb->_M_release();
+    return;
+  }
+
+#pragma clang loop vectorize(disable) unroll(disable)
+  for (std::uint32_t i = 0U; i < n_cpus; ++i) {
+    const std::uint16_t c = get_reg_cpu_locked(meta, i);
+    std::int64_t* const cell =
+        g_rseq_slab_base + (static_cast<std::size_t>(c) << kSlotShift) + slot;
+    __atomic_store_n(cell, 1, __ATOMIC_RELEASE);
+  }
+  meta.central_tickets.store(h_after, std::memory_order_relaxed);
+  __atomic_store_n(&old_cb->fast_.fast_active, 1U, __ATOMIC_RELEASE);
   unlock_cb(old_cb);
 }
 

@@ -195,20 +195,19 @@ THETA_FORCE_INLINE void sp_release(StdSpCountedBase* pi) noexcept {
   }
   if (is_theta_sp(pi)) [[likely]] {
     auto* cb = static_cast<ThetaSpCountedBase*>(pi);
-    if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U)
-        [[likely]] {
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
+    !THETA_TSAN_ENABLED
+    std::uint64_t hdr64 = 0ULL;
+    std::memcpy(&hdr64, &cb->fast_, sizeof(hdr64));
+    std::atomic_signal_fence(std::memory_order_acquire);
+    if ((hdr64 & (0xFFULL << 32U)) != 0ULL) [[likely]] {
       if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
         return;
       }
       sp_release_slow(pi);
       return;
     }
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
-    !THETA_TSAN_ENABLED
-    std::uint32_t state32 = 0U;
-    std::memcpy(&state32, &cb->fast_.fast_active, sizeof(state32));
-    std::atomic_signal_fence(std::memory_order_acquire);
-    if ((state32 & 0x00FFFFFFU) == 0U) [[likely]] {
+    if ((hdr64 & (0x00FFFFFFULL << 32U)) == 0ULL) [[likely]] {
       const std::uintptr_t tag = cb->ops_or_size_;
       if ((tag & 1U) != 0U) [[likely]] {
         ::operator delete(static_cast<void*>(cb), tag >> 1U);
@@ -218,6 +217,14 @@ THETA_FORCE_INLINE void sp_release(StdSpCountedBase* pi) noexcept {
       return;
     }
 #else
+    if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U)
+        [[likely]] {
+      if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
+        return;
+      }
+      sp_release_slow(pi);
+      return;
+    }
     if (__atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE) == kModeUnpromoted &&
         __atomic_load_n(&cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) == 0U)
         [[likely]] {
@@ -733,10 +740,26 @@ struct SpEsftAccess {
 
 struct SpAtomicAccess {
   template <typename PtrT>
-  static void raw_parts(const PtrT& p, void*& out_ptr,
-                        StdSpCountedBase*& out_pi) noexcept {
+  static THETA_FORCE_INLINE void raw_parts(const PtrT& p, void*& out_ptr,
+                                           StdSpCountedBase*& out_pi) noexcept {
     out_ptr = const_cast<void*>(static_cast<const volatile void*>(p.ptr_));
     out_pi = p.pi_;
+  }
+
+  template <typename T>
+  static THETA_FORCE_INLINE void take_parts(
+      SharedPtr<T>&& p, typename SharedPtr<T>::element_type*& out_ptr,
+      StdSpCountedBase*& out_pi) noexcept {
+    out_ptr = p.ptr_;
+    out_pi = p.pi_;
+    p.ptr_ = nullptr;
+    p.pi_ = nullptr;
+  }
+
+  template <typename T>
+  static THETA_FORCE_INLINE SharedPtr<T> make_adopted(
+      typename SharedPtr<T>::element_type* ptr, StdSpCountedBase* pi) noexcept {
+    return SharedPtr<T>(ptr, pi, AdoptRefTag{});
   }
 };
 
@@ -2014,44 +2037,36 @@ class KeepAlive {
     if (next.pi_ != nullptr) {
       void* raw_managed =
           const_cast<void*>(static_cast<const volatile void*>(next.get()));
-      if (!detail::shared_ptr::is_theta_sp(next.pi_)) {
-#if THETA_SHARED_PTR_HAS_GLIBCXX_ABI
-        std::shared_ptr<T> ext = next.to_std();
-        element_type* raw_p = ext.get();
-        next = SharedPtr<T>(
-            raw_p,
-            [hold = std::move(ext)](element_type*) mutable { hold.reset(); });
-#else
-        SharedPtr<T> ext = std::move(next);
-        element_type* raw_p = ext.get();
-        next = SharedPtr<T>(
-            raw_p,
-            [hold = std::move(ext)](element_type*) mutable { hold.reset(); });
-#endif
-      }
-      new_cb = static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
-      if (!detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed)) {
-        SharedPtr<T> hold_inner = std::move(next);
-        element_type* raw_p = hold_inner.get();
-        next =
-            SharedPtr<T>(raw_p, [hold = std::move(hold_inner)](
-                                    element_type*) mutable { hold.reset(); });
+      if (!detail::shared_ptr::is_theta_sp(next.pi_) ||
+          !detail::shared_ptr::sp_pin_for_keepalive(
+              static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_),
+              raw_managed)) [[unlikely]] {
+        new_cb = wrap_and_pin_cold(next, raw_managed);
+      } else {
         new_cb = static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
-        (void)detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed);
       }
     }
 
     SharedPtr<T> ret;
     SharedPtr<T> old_anchor;
+    detail::shared_ptr::ThetaSpCountedBase* old_cb = nullptr;
     {
       std::unique_lock<std::shared_mutex> lock(mutex_);
-      auto* old_cb = __atomic_exchange_n(&active_cb_, new_cb, __ATOMIC_ACQ_REL);
-      if (old_cb != nullptr) {
-        detail::shared_ptr::sp_keepalive_retire_old(old_cb);
-      }
+      old_cb = __atomic_exchange_n(&active_cb_, new_cb, __ATOMIC_ACQ_REL);
       old_anchor = std::move(anchor_);
       anchor_ = std::move(next);
       ret = anchor_;
+    }
+    if (old_cb != nullptr && old_anchor.pi_ == old_cb) [[likely]] {
+      old_anchor.ptr_ = nullptr;
+      old_anchor.pi_ = nullptr;
+      detail::shared_ptr::sp_unpin_and_retire_old(
+          old_cb, /*drop_anchor_ref=*/true,
+          /*quiesce_readers=*/(old_cb != new_cb));
+    } else if (old_cb != nullptr) {
+      detail::shared_ptr::sp_unpin_and_retire_old(
+          old_cb, /*drop_anchor_ref=*/false,
+          /*quiesce_readers=*/(old_cb != new_cb));
     }
     return ret;
   }
@@ -2076,6 +2091,34 @@ class KeepAlive {
   [[nodiscard]] SharedPtr<T> load() const noexcept { return get(); }
 
  private:
+  [[gnu::noinline, gnu::cold]] static detail::shared_ptr::ThetaSpCountedBase*
+  wrap_and_pin_cold(SharedPtr<T>& next, void* raw_managed) {
+    if (!detail::shared_ptr::is_theta_sp(next.pi_)) {
+#if THETA_SHARED_PTR_HAS_GLIBCXX_ABI
+      std::shared_ptr<T> ext = next.to_std();
+      element_type* raw_p = ext.get();
+      next = SharedPtr<T>(raw_p, [hold = std::move(ext)](
+                                     element_type*) mutable { hold.reset(); });
+#else
+      SharedPtr<T> ext = std::move(next);
+      element_type* raw_p = ext.get();
+      next = SharedPtr<T>(raw_p, [hold = std::move(ext)](
+                                     element_type*) mutable { hold.reset(); });
+#endif
+    }
+    auto* new_cb =
+        static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
+    if (!detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed)) {
+      SharedPtr<T> hold_inner = std::move(next);
+      element_type* raw_p = hold_inner.get();
+      next = SharedPtr<T>(raw_p, [hold = std::move(hold_inner)](
+                                     element_type*) mutable { hold.reset(); });
+      new_cb = static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
+      (void)detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed);
+    }
+    return new_cb;
+  }
+
   [[gnu::noinline]] SharedPtr<T> get_slow() const noexcept {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!anchor_) {
@@ -2113,13 +2156,42 @@ struct hash<::theta::SharedPtr<T>> {
 template <typename T>
 struct atomic<::theta::SharedPtr<T>> {
   using value_type = ::theta::SharedPtr<T>;
+  using element_type = typename value_type::element_type;
   static constexpr bool is_always_lock_free = false;
+
+  static_assert(alignof(::theta::detail::shared_ptr::StdSpCountedBase) >= 8U,
+                "StdSpCountedBase must be >= 8B aligned for 3-bit rep tags.");
 
   [[nodiscard]] bool is_lock_free() const noexcept { return false; }
 
   constexpr atomic() noexcept = default;
-  constexpr atomic(std::nullptr_t) noexcept : val_{} {}
-  atomic(value_type desired) noexcept : val_(std::move(desired)) {}
+  constexpr atomic(std::nullptr_t) noexcept : ptr_(nullptr), rep_(0ULL) {}
+  atomic(value_type desired) noexcept {
+    element_type* p = nullptr;
+    ::theta::detail::shared_ptr::StdSpCountedBase* pi = nullptr;
+    ::theta::detail::shared_ptr::SpAtomicAccess::take_parts(std::move(desired),
+                                                            p, pi);
+    ptr_ = p;
+    rep_ = (p == nullptr && pi == nullptr)
+               ? 0ULL
+               : (reinterpret_cast<std::uintptr_t>(pi) | kRepUnpinnedBit);
+  }
+
+  ~atomic() noexcept {
+    const std::uintptr_t cur = __atomic_load_n(&rep_, __ATOMIC_RELAXED);
+    auto* const pi =
+        reinterpret_cast<::theta::detail::shared_ptr::StdSpCountedBase*>(
+            cur & ~kRepFlagsMask);
+    if (pi != nullptr) {
+      if ((cur & kRepUnpinnedBit) == 0ULL) {
+        ::theta::detail::shared_ptr::sp_unpin_and_retire_old(
+            static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(pi),
+            /*drop_anchor_ref=*/true, /*quiesce_readers=*/false);
+      } else {
+        ::theta::detail::shared_ptr::sp_release(pi);
+      }
+    }
+  }
 
   atomic(const atomic&) = delete;
   void operator=(const atomic&) = delete;
@@ -2128,45 +2200,106 @@ struct atomic<::theta::SharedPtr<T>> {
   void operator=(std::nullptr_t) noexcept { store(nullptr); }
 
   [[nodiscard]] value_type load(
-      std::memory_order /*order*/ = std::memory_order_seq_cst) const noexcept {
-    ::theta::detail::shared_ptr::atomic_ptr_lock(this);
-    value_type out = val_;
-    ::theta::detail::shared_ptr::atomic_ptr_unlock(this);
-    return out;
+      std::memory_order order = std::memory_order_seq_cst) const noexcept {
+    (void)order;
+    ::theta::detail::shared_ptr::ThetaSpCountedBase* cb = nullptr;
+    std::uint32_t slot = 0U;
+    if (::theta::detail::shared_ptr::ArchBackend::try_rseq_atomic_load(
+            &rep_, cb, slot)) [[likely]] {
+      if (cb == nullptr) {
+        return value_type{};
+      }
+      return ::theta::detail::shared_ptr::SpAtomicAccess::make_adopted<T>(
+          static_cast<element_type*>(
+              ::theta::detail::shared_ptr::g_rseq_keepalive_ptrs[slot]),
+          cb);
+    }
+    return load_slow();
   }
 
   operator value_type() const noexcept { return load(); }
 
   void store(value_type desired,
-             std::memory_order /*order*/ = std::memory_order_seq_cst) noexcept {
-    ::theta::detail::shared_ptr::atomic_ptr_lock(this);
-    val_.swap(desired);
-    ::theta::detail::shared_ptr::atomic_ptr_unlock_and_notify(this, true);
+             std::memory_order order = std::memory_order_seq_cst) noexcept {
+    (void)exchange_or_store<false>(std::move(desired), order);
   }
 
   value_type exchange(
       value_type desired,
-      std::memory_order /*order*/ = std::memory_order_seq_cst) noexcept {
-    ::theta::detail::shared_ptr::atomic_ptr_lock(this);
-    val_.swap(desired);
-    ::theta::detail::shared_ptr::atomic_ptr_unlock_and_notify(this, true);
-    return desired;
+      std::memory_order order = std::memory_order_seq_cst) noexcept {
+    return exchange_or_store<true>(std::move(desired), order);
   }
 
   bool compare_exchange_strong(value_type& expected, value_type desired,
-                               std::memory_order /*success*/,
+                               std::memory_order success,
                                std::memory_order /*failure*/) noexcept {
-    value_type old_to_drop;
+    void* exp_p = nullptr;
+    ::theta::detail::shared_ptr::StdSpCountedBase* exp_pi = nullptr;
+    ::theta::detail::shared_ptr::SpAtomicAccess::raw_parts(expected, exp_p,
+                                                           exp_pi);
+
     ::theta::detail::shared_ptr::atomic_ptr_lock(this);
-    if (same_ptr_and_owner(val_, expected)) {
-      old_to_drop = std::move(val_);
-      val_ = std::move(desired);
+    const std::uintptr_t pre = __atomic_load_n(&rep_, __ATOMIC_RELAXED);
+    element_type* const cur_p = ptr_;
+    auto* const cur_pi =
+        reinterpret_cast<::theta::detail::shared_ptr::StdSpCountedBase*>(
+            pre & ~kRepFlagsMask);
+    const void* const cur_raw_p =
+        const_cast<const void*>(static_cast<const volatile void*>(cur_p));
+
+    if (cur_raw_p == exp_p && cur_pi == exp_pi) {
+      element_type* new_p = nullptr;
+      ::theta::detail::shared_ptr::StdSpCountedBase* new_pi = nullptr;
+      ::theta::detail::shared_ptr::SpAtomicAccess::take_parts(
+          std::move(desired), new_p, new_pi);
+
+      std::uintptr_t next_rep = pre;
+      bool was_pinned = false;
+      if (new_p != cur_p || new_pi != cur_pi) {
+        was_pinned = (cur_pi != nullptr) && ((pre & kRepUnpinnedBit) == 0ULL);
+        ptr_ = new_p;
+        if (new_p == nullptr && new_pi == nullptr) {
+          next_rep = 0ULL;
+        } else {
+          bool pinned_new = false;
+          if (was_pinned && new_p != nullptr &&
+              ::theta::detail::shared_ptr::is_theta_sp(new_pi)) {
+            auto* const new_cb =
+                static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
+                    new_pi);
+            pinned_new =
+                ::theta::detail::shared_ptr::sp_pin_for_keepalive(
+                    new_cb, const_cast<void*>(
+                                static_cast<const volatile void*>(new_p))) &&
+                (__atomic_load_n(&new_cb->fast_.mode, __ATOMIC_ACQUIRE) ==
+                 ::theta::detail::shared_ptr::kModePerCpuActive);
+          }
+          next_rep = reinterpret_cast<std::uintptr_t>(new_pi) |
+                     (pinned_new ? 0ULL : kRepUnpinnedBit);
+        }
+        publish_rep_locked(next_rep, success);
+      }
+
       ::theta::detail::shared_ptr::atomic_ptr_unlock_and_notify(this, true);
+      if (was_pinned) [[unlikely]] {
+        ::theta::detail::shared_ptr::sp_unpin_and_retire_old(
+            static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
+                cur_pi),
+            /*drop_anchor_ref=*/true, /*quiesce_readers=*/true);
+      } else if (new_p != cur_p || new_pi != cur_pi) {
+        ::theta::detail::shared_ptr::sp_release(cur_pi);
+      } else {
+        ::theta::detail::shared_ptr::sp_release(new_pi);
+      }
       return true;
     }
-    value_type current_copy = val_;
+
+    if (cur_pi != nullptr) {
+      ::theta::detail::shared_ptr::sp_add_ref(cur_pi);
+    }
     ::theta::detail::shared_ptr::atomic_ptr_unlock(this);
-    expected = std::move(current_copy);
+    expected = ::theta::detail::shared_ptr::SpAtomicAccess::make_adopted<T>(
+        cur_p, cur_pi);
     return false;
   }
 
@@ -2192,15 +2325,25 @@ struct atomic<::theta::SharedPtr<T>> {
   void wait(
       const value_type& old,
       std::memory_order /*order*/ = std::memory_order_seq_cst) const noexcept {
+    void* old_p = nullptr;
+    ::theta::detail::shared_ptr::StdSpCountedBase* old_pi = nullptr;
+    ::theta::detail::shared_ptr::SpAtomicAccess::raw_parts(old, old_p, old_pi);
+
     while (true) {
       ::theta::detail::shared_ptr::atomic_ptr_lock(this);
-      const std::uint32_t seq =
-          ::theta::detail::shared_ptr::atomic_ptr_seq(this);
-      const bool matches = same_ptr_and_owner(val_, old);
-      ::theta::detail::shared_ptr::atomic_ptr_unlock(this);
-      if (!matches) {
+      const std::uintptr_t pre = __atomic_load_n(&rep_, __ATOMIC_RELAXED);
+      const void* const cur_p =
+          const_cast<const void*>(static_cast<const volatile void*>(ptr_));
+      const auto* const cur_pi = reinterpret_cast<
+          const ::theta::detail::shared_ptr::StdSpCountedBase*>(pre &
+                                                                ~kRepFlagsMask);
+      if (cur_p != old_p || cur_pi != old_pi) {
+        ::theta::detail::shared_ptr::atomic_ptr_unlock(this);
         return;
       }
+      const std::uint32_t seq =
+          ::theta::detail::shared_ptr::atomic_ptr_seq(this);
+      ::theta::detail::shared_ptr::atomic_ptr_unlock(this);
       ::theta::detail::shared_ptr::atomic_ptr_wait_seq(this, seq);
     }
   }
@@ -2216,18 +2359,126 @@ struct atomic<::theta::SharedPtr<T>> {
   }
 
  private:
-  static bool same_ptr_and_owner(const value_type& a,
-                                 const value_type& b) noexcept {
-    void* ap = nullptr;
-    void* bp = nullptr;
-    ::theta::detail::shared_ptr::StdSpCountedBase* api = nullptr;
-    ::theta::detail::shared_ptr::StdSpCountedBase* bpi = nullptr;
-    ::theta::detail::shared_ptr::SpAtomicAccess::raw_parts(a, ap, api);
-    ::theta::detail::shared_ptr::SpAtomicAccess::raw_parts(b, bp, bpi);
-    return ap == bp && api == bpi;
+  static constexpr std::uintptr_t kRepUnpinnedBit = 2ULL;
+  static constexpr std::uintptr_t kRepNoPinBit = 4ULL;
+  static constexpr std::uintptr_t kRepFlagsMask = 7ULL;
+
+  THETA_FORCE_INLINE void publish_rep_locked(
+      std::uintptr_t next_rep, std::memory_order order) const noexcept {
+    if (order == std::memory_order_seq_cst) {
+      (void)__atomic_exchange_n(&rep_, next_rep, __ATOMIC_SEQ_CST);
+    } else {
+      __atomic_store_n(&rep_, next_rep, __ATOMIC_RELEASE);
+    }
   }
 
-  mutable value_type val_{};
+  [[gnu::noinline]] value_type load_slow() const noexcept {
+    ::theta::detail::shared_ptr::atomic_ptr_lock(this);
+    const std::uintptr_t pre = __atomic_load_n(&rep_, __ATOMIC_RELAXED);
+    element_type* const p = ptr_;
+    auto* const pi =
+        reinterpret_cast<::theta::detail::shared_ptr::StdSpCountedBase*>(
+            pre & ~kRepFlagsMask);
+    std::uintptr_t next_rep = pre;
+    if (pi != nullptr) {
+      ::theta::detail::shared_ptr::sp_add_ref(pi);
+      if (::theta::detail::shared_ptr::is_theta_sp(pi)) {
+        auto* const cb =
+            static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(pi);
+        const std::uint8_t m =
+            __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE);
+        if ((pre & kRepUnpinnedBit) != 0ULL) {
+          if ((pre & kRepNoPinBit) == 0ULL && p != nullptr &&
+              m == ::theta::detail::shared_ptr::kModePerCpuActive) {
+            bool never_pin = false;
+            if (::theta::detail::shared_ptr::sp_try_pin_atomic_fast(
+                    cb, const_cast<void*>(static_cast<const volatile void*>(p)),
+                    never_pin)) {
+              next_rep = reinterpret_cast<std::uintptr_t>(cb);
+            } else if (never_pin) {
+              next_rep = pre | kRepNoPinBit;
+            }
+          }
+        } else if (m != ::theta::detail::shared_ptr::kModePerCpuActive) {
+          next_rep = pre | kRepUnpinnedBit | kRepNoPinBit;
+        }
+      }
+    }
+    if (next_rep != pre) [[unlikely]] {
+      __atomic_store_n(&rep_, next_rep, __ATOMIC_RELEASE);
+    }
+    ::theta::detail::shared_ptr::atomic_ptr_unlock(this);
+    return ::theta::detail::shared_ptr::SpAtomicAccess::make_adopted<T>(p, pi);
+  }
+
+  template <bool ReturnOld>
+  value_type exchange_or_store(value_type desired,
+                               std::memory_order order) noexcept {
+    element_type* new_p = nullptr;
+    ::theta::detail::shared_ptr::StdSpCountedBase* new_pi = nullptr;
+    ::theta::detail::shared_ptr::SpAtomicAccess::take_parts(std::move(desired),
+                                                            new_p, new_pi);
+
+    ::theta::detail::shared_ptr::atomic_ptr_lock(this);
+    const std::uintptr_t pre = __atomic_load_n(&rep_, __ATOMIC_RELAXED);
+    element_type* const old_p = ptr_;
+    auto* const old_pi =
+        reinterpret_cast<::theta::detail::shared_ptr::StdSpCountedBase*>(
+            pre & ~kRepFlagsMask);
+
+    std::uintptr_t next_rep = pre;
+    bool was_pinned = false;
+    if (new_p != old_p || new_pi != old_pi) {
+      was_pinned = (old_pi != nullptr) && ((pre & kRepUnpinnedBit) == 0ULL);
+      ptr_ = new_p;
+      if (new_p == nullptr && new_pi == nullptr) {
+        next_rep = 0ULL;
+      } else {
+        bool pinned_new = false;
+        if (was_pinned && new_p != nullptr &&
+            ::theta::detail::shared_ptr::is_theta_sp(new_pi)) {
+          auto* const new_cb =
+              static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
+                  new_pi);
+          pinned_new =
+              ::theta::detail::shared_ptr::sp_pin_for_keepalive(
+                  new_cb, const_cast<void*>(
+                              static_cast<const volatile void*>(new_p))) &&
+              (__atomic_load_n(&new_cb->fast_.mode, __ATOMIC_ACQUIRE) ==
+               ::theta::detail::shared_ptr::kModePerCpuActive);
+        }
+        next_rep = reinterpret_cast<std::uintptr_t>(new_pi) |
+                   (pinned_new ? 0ULL : kRepUnpinnedBit);
+      }
+      publish_rep_locked(next_rep, order);
+    }
+
+    ::theta::detail::shared_ptr::atomic_ptr_unlock_and_notify(this, true);
+
+    if constexpr (ReturnOld) {
+      if (was_pinned) {
+        ::theta::detail::shared_ptr::sp_unpin_and_retire_old(
+            static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
+                old_pi),
+            /*drop_anchor_ref=*/false, /*quiesce_readers=*/true);
+      }
+      return ::theta::detail::shared_ptr::SpAtomicAccess::make_adopted<T>(
+          old_p, old_pi);
+    } else {
+      if (was_pinned) {
+        ::theta::detail::shared_ptr::sp_unpin_and_retire_old(
+            static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
+                old_pi),
+            /*drop_anchor_ref=*/true, /*quiesce_readers=*/true);
+      } else {
+        ::theta::detail::shared_ptr::sp_release(old_pi);
+      }
+      return value_type{};
+    }
+  }
+
+  mutable element_type* ptr_{nullptr};
+  mutable std::uintptr_t rep_{0ULL};
 };
 
 template <typename T>

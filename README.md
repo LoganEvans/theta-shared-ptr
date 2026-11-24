@@ -13,9 +13,9 @@
   - `theta::SharedPtr<T>` / `theta::shared_ptr<T>`, `theta::WeakPtr<T>` / `theta::weak_ptr<T>`, `theta::EnableSharedFromThis<T>` / `theta::enable_shared_from_this<T>` (plus automatic wiring of `std::enable_shared_from_this<T>`).
   - Scalar, bounded-array (`T[N]`), and single-allocation unbounded-array (`T[]`) `make_shared`, `make_shared_for_overwrite`, `allocate_shared`, and `allocate_shared_for_overwrite`.
   - `std::unique_ptr` adoption, custom deleters & allocators, `get_deleter`, `static_pointer_cast` / `dynamic_pointer_cast` / `const_pointer_cast` / `reinterpret_pointer_cast` (`const&` and `&&`), `<=>`, `owner_less` / `owner_equal` / `owner_hash`, `std::hash<theta::SharedPtr<T>>`, and `std::atomic<theta::SharedPtr<T>>` / `std::atomic<theta::WeakPtr<T>>`.
-- **Wait-Free `rseq` Hot Sharing & `KeepAlive<T>` Across Up to `8,192` CPUs**:
+- **Wait-Free `rseq` Hot Sharing, `std::atomic<theta::SharedPtr<T>>` & `KeepAlive<T>` Across Up to `8,192` CPUs**:
   - Unshared `make_shared<uint64_t>` + `~SharedPtr`: zero atomic RMWs and zero virtual calls on teardown via LSB-tagged sized `delete`.
-  - Concurrent `0 -> 1 -> 0` and `1 -> 2 -> 1` hot sharing and `theta::KeepAlive<T>::get()` execute inside a single CPU-local `rseq` critical section with zero `LOCK` instructions, zero memory fences, and zero cross-core cache-line invalidations.
+  - Concurrent `0 -> 1 -> 0` and `1 -> 2 -> 1` hot sharing, `theta::KeepAlive<T>::get()`, and `16 B` `std::atomic<theta::SharedPtr<T>>::load()` (`std::atomic<theta::shared_ptr<T>>`) execute inside a single CPU-local `rseq` critical section with zero `LOCK` instructions, zero shared cache-line writes, and adaptive read-warmup (`0` `SYS_membarrier` IPIs on write/CAS-dominated cells).
 
 ## Memory & Virtual-Address Footprint
 

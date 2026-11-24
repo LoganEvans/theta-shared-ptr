@@ -52,10 +52,10 @@ struct ArchBackend {
         "ldr %w[slot], [%[fast]]\n\t"
         "add %[idx], %[slot], %[idx], lsl #%c[shift]\n\t"
         "ldr %[val], [%[base], %[idx], lsl #3]\n\t"
-        "cbz %[val], %l[slow_inc_arm]\n\t"
-        "cmp %[val], #33\n\t"
+        "sub %[val], %[val], #1\n\t"
+        "cmp %[val], #32\n\t"
         "b.hs %l[slow_inc_arm]\n\t"
-        "add %[val], %[val], #1\n\t"
+        "add %[val], %[val], #2\n\t"
         "str %[val], [%[base], %[idx], lsl #3]\n\t"
         "3:\n\t"
         ".pushsection .text.unlikely, \"ax?\"\n\t"
@@ -150,7 +150,7 @@ struct ArchBackend {
         "add %[idx], %[idx], :lo12:1b\n\t"
         "str %[idx], [%[rseq], #8]\n\t"
         "2:\n\t"
-        "ldr %[cb], [%[cb_slot]]\n\t"
+        "ldar %[cb], [%[cb_slot]]\n\t"
         "cbz %[cb], %l[null_done_arm]\n\t"
         "ldrb %w[idx], [%[cb], #20]\n\t"
         "cbz %w[idx], %l[slow_ka_arm]\n\t"
@@ -160,11 +160,12 @@ struct ArchBackend {
         "ldr %w[slot], [%[cb], #16]\n\t"
         "add %[idx], %[slot], %[idx], lsl #%c[shift]\n\t"
         "ldr %[val], [%[base], %[idx], lsl #3]\n\t"
-        "cbz %[val], %l[slow_ka_arm]\n\t"
-        "add %[val], %[val], #1\n\t"
+        "sub %[val], %[val], #1\n\t"
+        "cmp %[val], #32\n\t"
+        "b.hs %l[slow_ka_arm]\n\t"
+        "add %[val], %[val], #2\n\t"
         "str %[val], [%[base], %[idx], lsl #3]\n\t"
         "3:\n\t"
-        "dmb ishld\n\t"
         ".pushsection .text.unlikely, \"ax?\"\n\t"
         ".inst 0xd428bc00\n\t"
         "4:\n\t"
@@ -183,6 +184,74 @@ struct ArchBackend {
     out_slot = 0U;
     return true;
   slow_ka_arm:
+    return false;
+  }
+
+  static THETA_FORCE_INLINE bool try_rseq_atomic_load(
+      const std::uintptr_t* rep_slot, ThetaSpCountedBase*& out_cb,
+      std::uint32_t& out_slot) noexcept {
+    const auto* tp = static_cast<const char*>(__builtin_thread_pointer());
+    const char* const rseq_base = tp + __rseq_offset;
+    std::int64_t* const base = g_rseq_slab_base;
+    if (base == nullptr) [[unlikely]] {
+      return false;
+    }
+    ThetaSpCountedBase* cb;
+    std::uint64_t idx;
+    std::uint64_t slot;
+    std::uint64_t val;
+
+    // WHY ASM: (a) OS/ABI control-flow contract — RCsc `ldar` tagged-pointer
+    // load + per-CPU counter increment inside one Linux `rseq` `[2f, 3f)`
+    // transaction (`0` exclusive monitors, pairs with `stlr`/`swpal` stores).
+    asm volatile goto(
+        ".pushsection __rseq_cs, \"aw?\"\n\t"
+        ".balign 32\n\t"
+        "1:\n\t"
+        ".long 0, 0\n\t"
+        ".quad 2f, (3f - 2f), 4f\n\t"
+        ".popsection\n\t"
+        "6:\n\t"
+        "adrp %[idx], 1b\n\t"
+        "add %[idx], %[idx], :lo12:1b\n\t"
+        "str %[idx], [%[rseq], #8]\n\t"
+        "2:\n\t"
+        "ldar %[cb], [%[rep_slot]]\n\t"
+        "cbz %[cb], %l[null_atomic_arm]\n\t"
+        "tst %[cb], #7\n\t"
+        "b.ne %l[slow_atomic_arm]\n\t"
+        "ldrb %w[idx], [%[cb], #20]\n\t"
+        "cbz %w[idx], %l[slow_atomic_arm]\n\t"
+        "ldr %w[idx], [%[rseq], #4]\n\t"
+        "cmp %w[idx], #2, lsl #12\n\t"
+        "b.hs %l[slow_atomic_arm]\n\t"
+        "ldr %w[slot], [%[cb], #16]\n\t"
+        "add %[idx], %[slot], %[idx], lsl #%c[shift]\n\t"
+        "ldr %[val], [%[base], %[idx], lsl #3]\n\t"
+        "sub %[val], %[val], #1\n\t"
+        "cmp %[val], #32\n\t"
+        "b.hs %l[slow_atomic_arm]\n\t"
+        "add %[val], %[val], #2\n\t"
+        "str %[val], [%[base], %[idx], lsl #3]\n\t"
+        "3:\n\t"
+        ".pushsection .text.unlikely, \"ax?\"\n\t"
+        ".inst 0xd428bc00\n\t"
+        "4:\n\t"
+        "b 6b\n\t"
+        ".popsection\n\t"
+        : [cb] "=&r"(cb), [idx] "=&r"(idx), [slot] "=&r"(slot), [val] "=&r"(val)
+        : [rseq] "r"(rseq_base), [rep_slot] "r"(rep_slot), [base] "r"(base),
+          [shift] "i"(kSlotShift)
+        : "memory", "cc"
+        : null_atomic_arm, slow_atomic_arm);
+    out_cb = cb;
+    out_slot = static_cast<std::uint32_t>(slot);
+    return true;
+  null_atomic_arm:
+    out_cb = nullptr;
+    out_slot = 0U;
+    return true;
+  slow_atomic_arm:
     return false;
   }
 

@@ -72,6 +72,12 @@ struct ArchBackend {
     return false;
   }
 
+  static THETA_FORCE_INLINE bool try_rseq_atomic_load(
+      const std::uintptr_t* /*rep_slot*/, ThetaSpCountedBase*& /*out_cb*/,
+      std::uint32_t& /*out_slot*/) noexcept {
+    return false;
+  }
+
   static THETA_FORCE_INLINE bool try_rseq_drain_local_surplus(
       SpFastHeader* fast, std::int64_t& out_drained) noexcept {
     if (__atomic_load_n(&fast->fast_active, __ATOMIC_ACQUIRE) == 0U) {

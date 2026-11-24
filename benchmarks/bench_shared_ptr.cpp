@@ -435,6 +435,107 @@ void BM_08b_MixedHotAndEphemeral_ThetaSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_08b_MixedHotAndEphemeral_ThetaSharedPtr)->Apply(apply_pair_sweep);
 
+// ============================================================================
+// 09. Hot Concurrent `std::atomic<shared_ptr<T>>::load()` (Pure Read Scaling)
+// ============================================================================
+void BM_09a_AtomicLoadHot_StdSharedPtr(benchmark::State& state) {
+  static auto* g_cell = new std::atomic<std::shared_ptr<std::uint64_t>>(
+      std::make_shared<std::uint64_t>(77ULL));
+  for (auto _ : state) {
+    auto snap = g_cell->load(std::memory_order_acquire);
+    benchmark::DoNotOptimize(*snap);
+  }
+}
+BENCHMARK(BM_09a_AtomicLoadHot_StdSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_09b_AtomicLoadHot_ThetaSharedPtr(benchmark::State& state) {
+  static auto* g_cell = new std::atomic<theta::SharedPtr<std::uint64_t>>(
+      theta::make_shared<std::uint64_t>(77ULL));
+  for (auto _ : state) {
+    auto snap = g_cell->load(std::memory_order_acquire);
+    benchmark::DoNotOptimize(*snap);
+  }
+}
+BENCHMARK(BM_09b_AtomicLoadHot_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
+// ============================================================================
+// 10. `std::atomic<shared_ptr<T>>` Live Snapshot Reload (16,383 Reads : 1 Swap)
+//     Direct C++20 `std::atomic` counterpart to `BM_05` (`KeepAliveSnapshot`).
+// ============================================================================
+void BM_10a_AtomicSnapshotReload_StdSharedPtr(benchmark::State& state) {
+  static auto* g_cell = new std::atomic<std::shared_ptr<std::uint64_t>>(
+      std::make_shared<std::uint64_t>(1ULL));
+  std::uint64_t iter = 0;
+  for (auto _ : state) {
+    if (state.thread_index() == 0 && ((++iter & 16383ULL) == 0ULL))
+        [[unlikely]] {
+      g_cell->store(std::make_shared<std::uint64_t>(iter),
+                    std::memory_order_release);
+    } else {
+      auto snap = g_cell->load(std::memory_order_acquire);
+      benchmark::DoNotOptimize(*snap);
+    }
+  }
+}
+BENCHMARK(BM_10a_AtomicSnapshotReload_StdSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_10b_AtomicSnapshotReload_ThetaSharedPtr(benchmark::State& state) {
+  static auto* g_cell = new std::atomic<theta::SharedPtr<std::uint64_t>>(
+      theta::make_shared<std::uint64_t>(1ULL));
+  std::uint64_t iter = 0;
+  for (auto _ : state) {
+    if (state.thread_index() == 0 && ((++iter & 16383ULL) == 0ULL))
+        [[unlikely]] {
+      g_cell->store(theta::make_shared<std::uint64_t>(iter),
+                    std::memory_order_release);
+    } else {
+      auto snap = g_cell->load(std::memory_order_acquire);
+      benchmark::DoNotOptimize(*snap);
+    }
+  }
+}
+BENCHMARK(BM_10b_AtomicSnapshotReload_ThetaSharedPtr)
+    ->Apply(apply_thread_sweep);
+
+// ============================================================================
+// 11. Contended Write-Heavy `compare_exchange_weak` Churn (100% CAS Mutations)
+//     Verifies adaptive `atomic_pin_reads` warmup prevents `SYS_membarrier`
+//     storms on write-dominated `std::atomic<theta::SharedPtr<T>>` cells.
+// ============================================================================
+void BM_11a_AtomicCasChurn_StdSharedPtr(benchmark::State& state) {
+  static auto* g_cell = new std::atomic<std::shared_ptr<std::uint64_t>>(
+      std::make_shared<std::uint64_t>(0ULL));
+  for (auto _ : state) {
+    auto cur = g_cell->load(std::memory_order_acquire);
+    for (;;) {
+      auto next = std::make_shared<std::uint64_t>(*cur + 1ULL);
+      if (g_cell->compare_exchange_weak(cur, std::move(next),
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        break;
+      }
+    }
+  }
+}
+BENCHMARK(BM_11a_AtomicCasChurn_StdSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_11b_AtomicCasChurn_ThetaSharedPtr(benchmark::State& state) {
+  static auto* g_cell = new std::atomic<theta::SharedPtr<std::uint64_t>>(
+      theta::make_shared<std::uint64_t>(0ULL));
+  for (auto _ : state) {
+    auto cur = g_cell->load(std::memory_order_acquire);
+    for (;;) {
+      auto next = theta::make_shared<std::uint64_t>(*cur + 1ULL);
+      if (g_cell->compare_exchange_weak(cur, std::move(next),
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        break;
+      }
+    }
+  }
+}
+BENCHMARK(BM_11b_AtomicCasChurn_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
 }  // namespace
 
 BENCHMARK_MAIN();
