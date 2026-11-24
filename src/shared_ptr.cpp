@@ -524,9 +524,10 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
 }
 
 [[gnu::aligned(64)]] void ThetaSpCountedBase::_M_destroy() noexcept {
+  const std::uint8_t m = __atomic_load_n(&fast_.mode, __ATOMIC_RELAXED);
   const std::uint32_t slot = __atomic_load_n(&fast_.slot_id, __ATOMIC_RELAXED);
-  if (slot != 0U) [[unlikely]] {
-    fast_.slot_id = 0U;
+  if (slot != 0U && m != kModeWarmup) [[unlikely]] {
+    __atomic_store_n(&fast_.slot_id, 0U, __ATOMIC_RELAXED);
     free_rseq_slot(slot);
   }
   const std::uintptr_t tag = ops_or_size_;
@@ -603,6 +604,12 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   lock_cb(cb);
   const std::uint8_t mode = cb->fast_.mode;
   if (mode == kModeUnpromoted) {
+    if constexpr (kPromotionWarmupCopies > 1U) {
+      __atomic_store_n(&cb->fast_.slot_id, (1U << 16U) | 2U, __ATOMIC_RELAXED);
+      __atomic_store_n(&cb->fast_.mode, kModeWarmup, __ATOMIC_RELEASE);
+      unlock_cb(cb);
+      return;
+    }
     if (promote_to_percpu_locked(cb, /*initial_tickets=*/1, /*first_delta=*/1,
                                  /*force_keepalive=*/false)) {
       unlock_cb(cb);
@@ -610,6 +617,31 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     }
     unlock_cb(cb);
     pi->_M_add_ref_copy();
+    return;
+  }
+
+  if (mode == kModeWarmup) {
+    const std::uint32_t packed =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    const std::uint32_t refs = packed & 0xFFFFU;
+    const std::uint32_t copies = (packed >> 16U) + 1U;
+    if (copies < kPromotionWarmupCopies && refs < 0xFFFEU) [[likely]] {
+      __atomic_store_n(&cb->fast_.slot_id, (copies << 16U) | (refs + 1U),
+                       __ATOMIC_RELAXED);
+      unlock_cb(cb);
+      return;
+    }
+    __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+    if (promote_to_percpu_locked(cb, static_cast<std::int64_t>(refs),
+                                 /*first_delta=*/1,
+                                 /*force_keepalive=*/false)) {
+      unlock_cb(cb);
+      return;
+    }
+    for (std::uint32_t i = 0U; i < refs; ++i) {
+      pi->_M_add_ref_copy();
+    }
+    unlock_cb(cb);
     return;
   }
 
@@ -678,6 +710,34 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     // Reached only when `has_weak_or_std != 0` (e.g. a `WeakPtr` or
     // `enable_shared_from_this` was formed). Transition to `kModeAtomicRetired`
     // before unlocking so concurrent `lock()` arbitrates on `_M_use_count`.
+    __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
+    unlock_cb(cb);
+    pi->_M_release();
+    return;
+  }
+
+  if (mode == kModeWarmup) {
+    const std::uint32_t packed =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    const std::uint32_t refs = packed & 0xFFFFU;
+    if (refs > 1U) [[likely]] {
+      __atomic_store_n(&cb->fast_.slot_id, (packed & 0xFFFF0000U) | (refs - 1U),
+                       __ATOMIC_RELAXED);
+      unlock_cb(cb);
+      return;
+    }
+    __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) == 0U)
+        [[likely]] {
+      unlock_cb(cb);
+      const std::uintptr_t tag = cb->ops_or_size_;
+      if ((tag & 1U) != 0U) [[likely]] {
+        ::operator delete(static_cast<void*>(cb), tag >> 1U);
+      } else {
+        reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
+      }
+      return;
+    }
     __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
     unlock_cb(cb);
     pi->_M_release();
@@ -784,6 +844,15 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
       static_cast<const ThetaSpCountedBase*>(pi));
   lock_cb(cb);
   const std::uint8_t mode = cb->fast_.mode;
+  if (mode == kModeWarmup) {
+    const long legacy_plus_base = pi->_M_get_use_count();
+    const long legacy_refs =
+        legacy_plus_base > 0L ? (legacy_plus_base - 1L) : 0L;
+    const long warmup_refs = static_cast<long>(
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED) & 0xFFFFU);
+    unlock_cb(cb);
+    return legacy_refs + warmup_refs;
+  }
   if (mode != kModePerCpuActive) {
     const long cnt = pi->_M_get_use_count();
     unlock_cb(cb);
@@ -817,12 +886,26 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   }
   auto* cb = static_cast<ThetaSpCountedBase*>(pi);
   __atomic_store_n(&cb->fast_.has_weak_or_std, 1U, __ATOMIC_RELEASE);
-  if (__atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE) == kModeUnpromoted) {
+  const std::uint8_t pre_mode =
+      __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE);
+  if (pre_mode == kModeUnpromoted || pre_mode == kModeWarmup) {
     lock_cb(cb);
     if (cb->fast_.mode == kModeUnpromoted) {
       (void)promote_to_percpu_locked(cb, /*initial_tickets=*/1,
                                      /*first_delta=*/0,
                                      /*force_keepalive=*/false);
+    } else if (cb->fast_.mode == kModeWarmup) {
+      const std::uint32_t packed =
+          __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+      const std::uint32_t refs = packed & 0xFFFFU;
+      __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+      if (!promote_to_percpu_locked(cb, static_cast<std::int64_t>(refs),
+                                    /*first_delta=*/0,
+                                    /*force_keepalive=*/false)) {
+        for (std::uint32_t i = 1U; i < refs; ++i) {
+          pi->_M_add_ref_copy();
+        }
+      }
     }
     unlock_cb(cb);
   }
@@ -846,6 +929,18 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     return;
   }
   if (mode == kModeUnpromoted) {
+    __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
+    unlock_cb(cb);
+    return;
+  }
+  if (mode == kModeWarmup) {
+    const std::uint32_t packed =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    const std::uint32_t refs = packed & 0xFFFFU;
+    __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+    for (std::uint32_t i = 1U; i < refs; ++i) {
+      cb->_M_add_ref_copy();
+    }
     __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
     unlock_cb(cb);
     return;
@@ -877,6 +972,23 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     pi->_M_release();
     return;
   }
+  if (cb->fast_.mode == kModeWarmup) {
+    const std::uint32_t packed =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    const std::uint32_t refs = packed & 0xFFFFU;
+    if (refs < 0xFFFEU) [[likely]] {
+      __atomic_store_n(&cb->fast_.slot_id, (packed & 0xFFFF0000U) | (refs + 1U),
+                       __ATOMIC_RELAXED);
+      unlock_cb(cb);
+      pi->_M_release();
+      return;
+    }
+    __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+    for (std::uint32_t i = 1U; i < refs; ++i) {
+      cb->_M_add_ref_copy();
+    }
+    __atomic_store_n(&cb->fast_.mode, kModeAtomicRetired, __ATOMIC_RELEASE);
+  }
   unlock_cb(cb);
 }
 
@@ -903,6 +1015,28 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     unlock_cb(cb);
     return true;
   }
+  if (mode == kModeWarmup) {
+    const std::uint32_t packed =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    const std::uint32_t refs = packed & 0xFFFFU;
+    const std::uint32_t copies = (packed >> 16U) + 1U;
+    if (copies < kPromotionWarmupCopies && refs < 0xFFFEU) [[likely]] {
+      __atomic_store_n(&cb->fast_.slot_id, (copies << 16U) | (refs + 1U),
+                       __ATOMIC_RELAXED);
+      unlock_cb(cb);
+      return true;
+    }
+    __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+    if (!promote_to_percpu_locked(cb, static_cast<std::int64_t>(refs + 1U),
+                                  /*first_delta=*/0,
+                                  /*force_keepalive=*/false)) {
+      for (std::uint32_t i = 0U; i < refs; ++i) {
+        cb->_M_add_ref_copy();
+      }
+    }
+    unlock_cb(cb);
+    return true;
+  }
 
   g_rseq_slot_meta[cb->fast_.slot_id].central_tickets.fetch_add(
       1, std::memory_order_relaxed);
@@ -916,6 +1050,18 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   if (cb->fast_.mode == kModeUnpromoted) {
     (void)promote_to_percpu_locked(cb, /*initial_tickets=*/1, /*first_delta=*/0,
                                    /*force_keepalive=*/true);
+  } else if (cb->fast_.mode == kModeWarmup) {
+    const std::uint32_t packed =
+        __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    const std::uint32_t refs = packed & 0xFFFFU;
+    __atomic_store_n(&cb->fast_.slot_id, 0U, __ATOMIC_RELAXED);
+    if (!promote_to_percpu_locked(cb, static_cast<std::int64_t>(refs),
+                                  /*first_delta=*/0,
+                                  /*force_keepalive=*/true)) {
+      for (std::uint32_t i = 1U; i < refs; ++i) {
+        cb->_M_add_ref_copy();
+      }
+    }
   } else if (cb->fast_.mode == kModePerCpuActive) {
     const std::uint32_t slot = cb->fast_.slot_id;
     const std::int32_t cpu = current_cpu_id();

@@ -15,11 +15,14 @@
 //      `make_shared<T>` allocates `32 B + sizeof(T)` in a single allocation
 //      (`+8 B` over `std::make_shared<T>`'s `24 B + sizeof(T)`; `40 B` -> same
 //      `48 B` glibc `malloc` bin for 8-byte types).
-//   3. Uncopied / sole-owner pointers (`0 B` extra RSS):
-//      Pointers that are only moved or never copied stay in `kModeUnpromoted`,
-//      allocate `0` per-CPU slots, touch `0` slab/metadata pages, and destroy
-//      with `0` atomic RMWs and `0` virtual calls.
-//   4. Promoted (copied) pointers & `KeepAlive<T>` (`MAP_NORESERVE` slabs):
+//   3. Uncopied & ephemeral pointers (`0 .. 7` copies -> `0 B` extra RSS):
+//      Sole-owner pointers (`0` copies, incl. cross-CPU `std::move`) stay in
+//      `kModeUnpromoted` and destroy with `0` atomic RMWs and `0` virtual
+//      calls. Ephemeral shared pointers (`1 .. 7` copies, e.g. cross-CPU RPC
+//      or queue handoffs) stay in `kModeWarmup` inline inside `SpFastHeader`,
+//      allocating `0` per-CPU slots, faulting `0` slab pages, and firing `0`
+//      `SYS_membarrier` IPIs on cross-CPU teardown.
+//   4. Promoted (`>= 8` copies) pointers & `KeepAlive<T>` (`MAP_NORESERVE`):
 //      - Virtual address reservation (uncommitted, `0 B` physical RAM until
 //        faulted): `131,072` slots * `8,192` CPUs * `8 B` = `8 GiB` slab VA
 //        (`256 MiB` under ASan/TSan) + `8 MiB` slot-metadata VA + `1 MiB`

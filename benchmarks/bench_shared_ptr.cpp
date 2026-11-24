@@ -283,6 +283,158 @@ void BM_06b_Table2K_ThetaSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_06b_Table2K_ThetaSharedPtr)->Apply(apply_thread_sweep);
 
+// ============================================================================
+// 07. Ephemeral Cross-Thread Create + 1-Copy + Immediate Destroy (Max Rate)
+//     Producer constructs a fresh object on CPU A, copies it (`1 -> 2`) into
+//     an outbound SPSC queue while finishing local scope work, and drops its
+//     local ref (`2 -> 1`); Consumer pops on CPU B and immediately destroys the
+//     final ref (`1 -> 0`).
+// ============================================================================
+template <typename PtrType, typename MakeFn>
+void run_ephemeral_cross_cpu_bench(benchmark::State& state, MakeFn make_fn,
+                                   std::uint32_t work_spins) {
+  static std::array<SpscRing<PtrType>, 128> rings{};
+  const int pair_id = state.thread_index() / 2;
+  auto& ring = rings[static_cast<std::size_t>(pair_id) & 127U];
+
+  if (state.thread_index() % 2 == 0) {
+    std::uint64_t seq = 0;
+    for (auto _ : state) {
+      for (std::uint32_t s = 0; s < work_spins; ++s) {
+        theta::arch::cpu_relax();
+      }
+      PtrType local = make_fn(++seq);
+      std::uint64_t t = ring.tail.load(std::memory_order_relaxed);
+      while (t - ring.head.load(std::memory_order_acquire) >=
+             SpscRing<PtrType>::kCap) {
+        theta::arch::cpu_relax();
+      }
+      ring.slots[t & (SpscRing<PtrType>::kCap - 1U)] = local;
+      ring.tail.store(t + 1ULL, std::memory_order_release);
+      benchmark::DoNotOptimize(local);
+    }
+    while (ring.head.load(std::memory_order_acquire) !=
+           ring.tail.load(std::memory_order_relaxed)) {
+      theta::arch::cpu_relax();
+    }
+  } else {
+    for (auto _ : state) {
+      std::uint64_t h = ring.head.load(std::memory_order_relaxed);
+      while (ring.tail.load(std::memory_order_acquire) == h) {
+        theta::arch::cpu_relax();
+      }
+      PtrType item = std::move(ring.slots[h & (SpscRing<PtrType>::kCap - 1U)]);
+      ring.head.store(h + 1ULL, std::memory_order_release);
+      benchmark::DoNotOptimize(item);
+    }
+  }
+}
+
+void BM_07a_EphemeralCrossCpu_StdSharedPtr(benchmark::State& state) {
+  run_ephemeral_cross_cpu_bench<std::shared_ptr<std::uint64_t>>(
+      state, [](std::uint64_t v) { return std::make_shared<std::uint64_t>(v); },
+      /*work_spins=*/0U);
+}
+BENCHMARK(BM_07a_EphemeralCrossCpu_StdSharedPtr)->Apply(apply_pair_sweep);
+
+void BM_07b_EphemeralCrossCpu_ThetaSharedPtr(benchmark::State& state) {
+  run_ephemeral_cross_cpu_bench<theta::SharedPtr<std::uint64_t>>(
+      state,
+      [](std::uint64_t v) { return theta::make_shared<std::uint64_t>(v); },
+      /*work_spins=*/0U);
+}
+BENCHMARK(BM_07b_EphemeralCrossCpu_ThetaSharedPtr)->Apply(apply_pair_sweep);
+
+// ============================================================================
+// 08. Mixed Workload: 98.4% Hot Shared-Cache Reads + 1.6% Ephemeral Cross-CPU
+//     Create/Copy/Destroy + Periodic Cache Rotation
+//     Models a real RPC/storage server where worker threads read a periodically
+//     refreshed shared handle (`63/64` ops) while also passing 1-copy ephemeral
+//     per-request handles across CPUs (`1/64` ops).
+// ============================================================================
+template <typename PtrType>
+struct HotVersionRing {
+  static constexpr std::size_t kSlots = 65536;
+  alignas(64) std::atomic<std::size_t> ver{0};
+  std::array<PtrType, kSlots> slots{};
+};
+
+template <typename PtrType, typename MakeFn>
+void run_mixed_hot_and_ephemeral_bench(benchmark::State& state,
+                                       MakeFn make_fn) {
+  static std::array<SpscRing<PtrType>, 128> rings{};
+  static auto* g_hot = [make_fn]() {
+    auto* hr = new HotVersionRing<PtrType>();
+    hr->slots[0] = make_fn(1ULL);
+    return hr;
+  }();
+
+  const int tid = state.thread_index();
+  const int pair_id = tid / 2;
+  auto& ring = rings[static_cast<std::size_t>(pair_id) & 127U];
+
+  std::uint64_t iter = 0;
+  for (auto _ : state) {
+    ++iter;
+    if (tid == 0 && ((iter & 4095ULL) == 0ULL)) [[unlikely]] {
+      const std::size_t cur = g_hot->ver.load(std::memory_order_relaxed);
+      const std::size_t nxt = cur + 1U;
+      if (nxt < HotVersionRing<PtrType>::kSlots) [[likely]] {
+        g_hot->slots[nxt] = make_fn(iter);
+        g_hot->ver.store(nxt, std::memory_order_release);
+      }
+    }
+
+    if ((iter & 63ULL) == 0ULL) [[unlikely]] {
+      if (tid % 2 == 0) {
+        PtrType local = make_fn(iter);
+        std::uint64_t t = ring.tail.load(std::memory_order_relaxed);
+        while (t - ring.head.load(std::memory_order_acquire) >=
+               SpscRing<PtrType>::kCap) {
+          theta::arch::cpu_relax();
+        }
+        ring.slots[t & (SpscRing<PtrType>::kCap - 1U)] = local;
+        ring.tail.store(t + 1ULL, std::memory_order_release);
+        benchmark::DoNotOptimize(local);
+      } else {
+        std::uint64_t h = ring.head.load(std::memory_order_relaxed);
+        while (ring.tail.load(std::memory_order_acquire) == h) {
+          theta::arch::cpu_relax();
+        }
+        PtrType item =
+            std::move(ring.slots[h & (SpscRing<PtrType>::kCap - 1U)]);
+        ring.head.store(h + 1ULL, std::memory_order_release);
+        benchmark::DoNotOptimize(item);
+      }
+    } else {
+      const std::size_t v = g_hot->ver.load(std::memory_order_acquire);
+      PtrType snap = g_hot->slots[v];
+      benchmark::DoNotOptimize(snap);
+    }
+  }
+
+  if (tid % 2 == 0) {
+    while (ring.head.load(std::memory_order_acquire) !=
+           ring.tail.load(std::memory_order_relaxed)) {
+      theta::arch::cpu_relax();
+    }
+  }
+}
+
+void BM_08a_MixedHotAndEphemeral_StdSharedPtr(benchmark::State& state) {
+  run_mixed_hot_and_ephemeral_bench<std::shared_ptr<std::uint64_t>>(
+      state,
+      [](std::uint64_t v) { return std::make_shared<std::uint64_t>(v); });
+}
+BENCHMARK(BM_08a_MixedHotAndEphemeral_StdSharedPtr)->Apply(apply_pair_sweep);
+
+void BM_08b_MixedHotAndEphemeral_ThetaSharedPtr(benchmark::State& state) {
+  run_mixed_hot_and_ephemeral_bench<theta::SharedPtr<std::uint64_t>>(
+      state,
+      [](std::uint64_t v) { return theta::make_shared<std::uint64_t>(v); });
+}
+BENCHMARK(BM_08b_MixedHotAndEphemeral_ThetaSharedPtr)->Apply(apply_pair_sweep);
+
 }  // namespace
 
 BENCHMARK_MAIN();

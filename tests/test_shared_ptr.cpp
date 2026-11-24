@@ -714,5 +714,93 @@ TEST(SharedPtrSemanticsTest, OverAlignedAndAliasedKeepAlive) {
   }
 }
 
+TEST(SharedPtrSemanticsTest, WarmupLifecycleInteropAndCrossCpuChurn) {
+  TrackedBase::reset_counts();
+
+  // 1. Copies 1..7 stay in `kModeWarmup` (`fast_active == 0`), copy #8 promotes
+  {
+    auto root = make_shared<TrackedBase>(55);
+    std::vector<SharedPtr<TrackedBase>> copies;
+    for (std::uint32_t i = 1; i < detail::shared_ptr::kPromotionWarmupCopies;
+         ++i) {
+      copies.push_back(root);
+      EXPECT_EQ(root.use_count(), static_cast<long>(i + 1U));
+    }
+    copies.push_back(root);  // Copy #8 -> promotes to `kModePerCpuActive`
+    EXPECT_EQ(
+        root.use_count(),
+        static_cast<long>(detail::shared_ptr::kPromotionWarmupCopies + 1U));
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+
+  // 2. `to_std()` copy/move, `WeakPtr::lock()`, and `KeepAlive` during warmup
+#if THETA_SHARED_PTR_HAS_GLIBCXX_ABI
+  {
+    auto p1 = make_shared<TrackedBase>(77);
+    auto p2 = p1;  // Warmup copy #1 (`use_count == 2`)
+    WeakPtr<TrackedBase> wp(p1);
+    auto p3 = wp.lock();
+    ASSERT_TRUE(p3);
+    EXPECT_EQ(p1.use_count(), 3L);
+
+    std::shared_ptr<TrackedBase> sp_copy = p2.to_std();
+    EXPECT_EQ(p1.use_count(), 4L);
+
+    auto m1 = make_shared<TrackedBase>(88);
+    auto m2 = m1;  // Warmup copy #1
+    std::shared_ptr<TrackedBase> sp_moved = std::move(m2).to_std();
+    EXPECT_FALSE(m2);
+    EXPECT_EQ(m1.use_count(), 2L);
+    EXPECT_EQ(sp_moved.use_count(), 2L);
+
+    auto k1 = make_shared<TrackedBase>(99);
+    auto k2 = k1;  // Warmup copy #1 -> `KeepAlive` forces immediate promotion
+    KeepAlive<TrackedBase> ka(k1);
+    EXPECT_EQ(ka.get()->base_val, 99);
+    EXPECT_EQ(k2->base_val, 99);
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+#endif
+
+  // 3. Multi-threaded ephemeral 1..3-copy cross-thread handoff & teardown
+  {
+    constexpr std::size_t kPairs = 2;
+    constexpr int kItems = 2000;
+    struct HandoffSlot {
+      std::atomic<int> state{0};
+      SharedPtr<TrackedBase> slot;
+    };
+    std::array<HandoffSlot, kPairs> slots{};
+    std::vector<std::thread> threads;
+    for (std::size_t p = 0; p < kPairs; ++p) {
+      threads.emplace_back([&, p]() {
+        for (int i = 0; i < kItems; ++i) {
+          auto obj = make_shared<TrackedBase>(i);
+          auto trace_copy = obj;
+          while (slots[p].state.load(std::memory_order_acquire) != 0) {
+            arch::cpu_relax();
+          }
+          slots[p].slot = trace_copy;
+          slots[p].state.store(1, std::memory_order_release);
+        }
+      });
+      threads.emplace_back([&, p]() {
+        for (int i = 0; i < kItems; ++i) {
+          while (slots[p].state.load(std::memory_order_acquire) != 1) {
+            arch::cpu_relax();
+          }
+          SharedPtr<TrackedBase> item = std::move(slots[p].slot);
+          slots[p].state.store(0, std::memory_order_release);
+          EXPECT_EQ(item->base_val, i);
+        }
+      });
+    }
+    for (auto& th : threads) {
+      th.join();
+    }
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+}
+
 }  // namespace
 }  // namespace theta

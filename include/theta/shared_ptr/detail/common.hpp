@@ -45,6 +45,13 @@ inline constexpr std::uint32_t kMaxStripedSlots = (1U << kSlotShift);
 inline constexpr std::uint8_t kModeUnpromoted = 0U;
 inline constexpr std::uint8_t kModePerCpuActive = 1U;
 inline constexpr std::uint8_t kModeAtomicRetired = 2U;
+inline constexpr std::uint8_t kModeWarmup = 3U;
+
+// Lazy per-object promotion warmup threshold: newly copied control blocks count
+// their first `1 .. kPromotionWarmupCopies - 1` copies inline inside
+// `SpFastHeader` (`0` per-CPU slots, `0 B` slab RSS, `0` `SYS_membarrier` IPIs
+// on cross-CPU teardown) before promoting to `kModePerCpuActive` on copy `#8`.
+inline constexpr std::uint32_t kPromotionWarmupCopies = 8U;
 
 // Standard-layout 8-byte hot header embedded inside `ThetaSpCountedBase` so
 // inline `rseq` assembly accesses `slot_id` (+0) and `fast_active` (+4) with

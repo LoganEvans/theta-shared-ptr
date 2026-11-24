@@ -25,10 +25,10 @@
 | :--- | :--- | :--- | :--- |
 | **Inline handle (`sizeof`)** | `16 B` | `16 B` | Identical `[T*, _Sp_counted_base*]` ABI layout |
 | **`make_shared<T>` heap block** | `24 B + sizeof(T)` | `32 B + sizeof(T)` | `40 B` for `uint64_t` -> same `48 B` glibc `malloc` chunk |
-| **Uncopied pointer (`use_count == 1`)** | `0 B` extra | **`0 B` extra** | Stays in `kModeUnpromoted`; allocates `0` slots and faults `0` slab pages |
+| **Sole-owner (`0` copies) & ephemeral (`1..7` copies)** | `0 B` extra | **`0 B` extra** | `kModeUnpromoted` (`0` atomics) & `kModeWarmup` (`< 8` copies): `0` slots, `0` slab pages, **`0` `SYS_membarrier` IPIs** |
 | **Process virtual address (`VIRT`)** | `0 B` | **`8.01 GiB` `MAP_NORESERVE`** | `131,072` slots × `8,192` CPUs × `8 B` (`256 MiB` under ASan/TSan); **`0 B` physical RAM until faulted** |
-| **Cold-start RSS (1st copied ptr)** | `0 B` | **`4 KiB` + `4 KiB × active_cpus`** | `(cpu << 17) + slot_id` packs **`512` pointers per `4 KiB` CPU page** (`~52 KiB` on 12 CPUs; `0 B` on unused CPUs) |
-| **Marginal RSS (copied ptrs `#2..#511`)** | `0 B` | **`64 B` + `8 B × active_cpus`** | Reuses faulted `4 KiB` pages (`160 B`/ptr on 12 CPUs, `576 B`/ptr on 64 CPUs; `+8 B` if in `KeepAlive<T>`) |
+| **Cold-start RSS (1st promoted ptr, `>= 8` copies)** | `0 B` | **`4 KiB` + `4 KiB × active_cpus`** | `(cpu << 17) + slot_id` packs **`512` pointers per `4 KiB` CPU page** (`~52 KiB` on 12 CPUs; `0 B` on unused CPUs) |
+| **Marginal RSS (promoted ptrs `#2..#511`)** | `0 B` | **`64 B` + `8 B × active_cpus`** | Reuses faulted `4 KiB` pages (`160 B`/ptr on 12 CPUs, `576 B`/ptr on 64 CPUs; `+8 B` if in `KeepAlive<T>`) |
 | **Slot recycling & saturation** | N/A | **`131,072` concurrent slots** | Freed `slot_id`s recycle via `initial-exec` TLS (`0` new faults); `> 131,072` live shared objects fall back to atomic `_Sp_counted_base` |
 
 ## Build & Test
