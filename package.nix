@@ -1,41 +1,33 @@
+# FILENAME: package.nix
 {
-  clangStdenv,
+  llvmPackages_23,
   cmake,
-  fmt,
+  pkg-config,
   gbenchmark,
-  glog,
   gtest,
-  librseq,
-  pkgconf,
+  linuxHeaders,
+  theta-cmake ? null,
   src,
-  theta-debug-utils,
-  linuxPackages,
-  flamegraph,
 }:
-let
-in
-clangStdenv.mkDerivation rec {
+llvmPackages_23.stdenv.mkDerivation {
   inherit src;
-  name = "hyper-shared-ptr";
+  pname = "theta-hyper-shared-ptr";
+  version = "0.2.0";
 
-  outputs = [
-    "out"
-  ];
+  outputs = [ "out" ];
 
   buildInputs = [
-    fmt
     gbenchmark
-    glog
     gtest
-    librseq
-    theta-debug-utils
+    linuxHeaders
   ];
+
+  propagatedBuildInputs = builtins.filter (x: x != null) [ theta-cmake ];
 
   nativeBuildInputs = [
     cmake
-    pkgconf
-    linuxPackages.perf
-    flamegraph
+    pkg-config
+    llvmPackages_23.clang-tools
   ];
 
   dontStrip = true;
@@ -44,6 +36,6 @@ clangStdenv.mkDerivation rec {
 
   doCheck = false;
   env = {
-    BUILD_BENCHMARK = false;
+    BUILD_BENCHMARK = "OFF";
   };
 }
