@@ -778,8 +778,13 @@ TEST(SharedPtrSemanticsTest, WarmupLifecycleInteropAndCrossCpuChurn) {
         for (int i = 0; i < kItems; ++i) {
           auto obj = make_shared<TrackedBase>(i);
           auto trace_copy = obj;
+          unsigned int spins = 0U;
           while (slots[p].state.load(std::memory_order_acquire) != 0) {
-            arch::cpu_relax();
+            if ((++spins & 63U) == 0U) {
+              std::this_thread::yield();
+            } else {
+              arch::cpu_relax();
+            }
           }
           slots[p].slot = trace_copy;
           slots[p].state.store(1, std::memory_order_release);
@@ -787,8 +792,13 @@ TEST(SharedPtrSemanticsTest, WarmupLifecycleInteropAndCrossCpuChurn) {
       });
       threads.emplace_back([&, p]() {
         for (int i = 0; i < kItems; ++i) {
+          unsigned int spins = 0U;
           while (slots[p].state.load(std::memory_order_acquire) != 1) {
-            arch::cpu_relax();
+            if ((++spins & 63U) == 0U) {
+              std::this_thread::yield();
+            } else {
+              arch::cpu_relax();
+            }
           }
           SharedPtr<TrackedBase> item = std::move(slots[p].slot);
           slots[p].state.store(0, std::memory_order_release);
@@ -1028,6 +1038,299 @@ TEST(SharedPtrTest, BurstyKeepAliveAndAtomicReloadStormThrottlesAndRecovers) {
     }
   }
   EXPECT_EQ(TrackedBase::live.load(), 0);
+}
+
+struct OrderLog {
+  std::vector<int> ctors;
+  std::vector<int> dtors;
+  int next_id{0};
+  int throw_on_id{-1};
+};
+
+struct OrderElem {
+  static inline OrderLog* g_log = nullptr;
+  int id{-1};
+  int val{0};
+
+  OrderElem() : val(11) { record_ctor(); }
+  explicit OrderElem(int v) : val(v) { record_ctor(); }
+  OrderElem(const OrderElem& o) : val(o.val) { record_ctor(); }
+
+  void record_ctor() {
+    if (g_log != nullptr) {
+      const int cur = g_log->next_id++;
+      if (g_log->throw_on_id >= 0 && cur == g_log->throw_on_id) {
+        throw std::runtime_error("OrderElem ctor boom");
+      }
+      id = cur;
+      g_log->ctors.push_back(id);
+    }
+  }
+
+  ~OrderElem() {
+    if (g_log != nullptr && id >= 0) {
+      g_log->dtors.push_back(id);
+    }
+    val = -999;
+  }
+};
+
+struct AllocStats {
+  std::size_t alloc_bytes{0};
+  std::size_t dealloc_bytes{0};
+  std::size_t construct_calls{0};
+  std::size_t destroy_calls{0};
+  int tag{0};
+};
+
+template <typename T>
+struct AuditAlloc {
+  using value_type = T;
+  AllocStats* stats{nullptr};
+  int tag{0};
+
+  AuditAlloc() noexcept = default;
+  AuditAlloc(AllocStats* s, int t) noexcept : stats(s), tag(t) {}
+
+  template <typename U>
+  AuditAlloc(const AuditAlloc<U>& o) noexcept : stats(o.stats), tag(o.tag) {}
+
+  T* allocate(std::size_t n) {
+    if (stats != nullptr) {
+      stats->alloc_bytes += n * sizeof(T);
+    }
+    return std::allocator<T>{}.allocate(n);
+  }
+
+  void deallocate(T* p, std::size_t n) noexcept {
+    if (stats != nullptr) {
+      stats->dealloc_bytes += n * sizeof(T);
+    }
+    std::allocator<T>{}.deallocate(p, n);
+  }
+
+  template <typename U, typename... Args>
+  void construct(U* p, Args&&... args) {
+    ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    if (stats != nullptr) {
+      ++stats->construct_calls;
+    }
+  }
+
+  template <typename U>
+  void destroy(U* p) noexcept {
+    if (stats != nullptr) {
+      ++stats->destroy_calls;
+    }
+    std::destroy_at(p);
+  }
+
+  template <typename U>
+  bool operator==(const AuditAlloc<U>& o) const noexcept {
+    return stats == o.stats && tag == o.tag;
+  }
+};
+
+TEST(SharedPtrTest, MultidimensionalArraysAndCustomAllocatorLifecycle) {
+  // 1. `make_shared` & `make_shared_for_overwrite` on 2D/3D/const bounded and
+  // unbounded arrays + reverse destruction order verification.
+  OrderLog log;
+  OrderElem::g_log = &log;
+  {
+    auto m2d = make_shared<OrderElem[2][3]>();
+    ASSERT_EQ(log.ctors.size(), 6U);
+    for (int r = 0; r < 2; ++r) {
+      for (int c = 0; c < 3; ++c) {
+        EXPECT_EQ(m2d[r][c].val, 11);
+      }
+    }
+  }
+  ASSERT_EQ(log.dtors.size(), 6U);
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_EQ(log.ctors[static_cast<std::size_t>(i)], i);
+    EXPECT_EQ(log.dtors[static_cast<std::size_t>(i)], 5 - i);
+  }
+
+  // 2D fill (`make_shared<const OrderElem[2][3]>(row)`) + 3D + unbounded 2D
+  OrderElem::g_log = nullptr;
+  const OrderElem fill_row[3]{OrderElem(10), OrderElem(20), OrderElem(30)};
+  log = OrderLog{};
+  OrderElem::g_log = &log;
+  {
+    auto cm2d = make_shared<const OrderElem[2][3]>(fill_row);
+    EXPECT_EQ(cm2d[0][0].val, 10);
+    EXPECT_EQ(cm2d[0][2].val, 30);
+    EXPECT_EQ(cm2d[1][1].val, 20);
+
+    auto m3d = make_shared<int[2][3][4]>();
+    EXPECT_EQ(m3d[1][2][3], 0);
+    auto cm3d = make_shared_for_overwrite<const int[2][3][4]>();
+    ASSERT_NE(cm3d.get(), nullptr);
+
+    auto u2d = make_shared<const OrderElem[][3]>(2U, fill_row);
+    EXPECT_EQ(u2d[1][0].val, 10);
+    EXPECT_EQ(u2d[1][2].val, 30);
+  }
+  EXPECT_EQ(log.ctors.size(), 12U);
+  EXPECT_EQ(log.dtors.size(), 12U);
+
+  // Mid-construction exception unwind in 2D bounded & unbounded `make_shared`
+  log = OrderLog{};
+  log.throw_on_id = 4;
+  EXPECT_THROW((void)make_shared<OrderElem[2][3]>(fill_row),
+               std::runtime_error);
+  ASSERT_EQ(log.ctors.size(), 4U);
+  ASSERT_EQ(log.dtors.size(), 4U);
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(log.dtors[static_cast<std::size_t>(i)], 3 - i);
+  }
+
+  // 2. `allocate_shared` stateful `AuditAlloc` construct/destroy parity across
+  // scalar, 2D bounded, const 2D bounded fill, and 2D unbounded arrays.
+  AllocStats stats{};
+  AuditAlloc<OrderElem> alloc(&stats, 77);
+  log = OrderLog{};
+  {
+    auto s_scalar = allocate_shared<OrderElem>(alloc, 42);
+    EXPECT_EQ(s_scalar->val, 42);
+    EXPECT_EQ(stats.construct_calls, 1U);
+
+    auto s_b2d = allocate_shared<OrderElem[2][3]>(alloc);
+    EXPECT_EQ(s_b2d[1][2].val, 11);
+    EXPECT_EQ(stats.construct_calls, 7U);
+
+    auto s_cb2d = allocate_shared<const OrderElem[2][3]>(alloc, fill_row);
+    EXPECT_EQ(s_cb2d[1][2].val, 30);
+    EXPECT_EQ(stats.construct_calls, 13U);
+
+    auto s_u2d = allocate_shared<OrderElem[][3]>(alloc, 2U, fill_row);
+    EXPECT_EQ(s_u2d[0][1].val, 20);
+    EXPECT_EQ(stats.construct_calls, 19U);
+  }
+  EXPECT_EQ(stats.construct_calls, 19U);
+  EXPECT_EQ(stats.destroy_calls, 19U);
+  EXPECT_EQ(stats.alloc_bytes, stats.dealloc_bytes);
+  EXPECT_EQ(log.ctors.size(), 19U);
+  EXPECT_EQ(log.dtors.size(), 19U);
+
+  // Exception unwind under `allocate_shared` on 2D bounded & 2D unbounded
+  stats = AllocStats{};
+  log = OrderLog{};
+  log.throw_on_id = 4;
+  EXPECT_THROW((void)allocate_shared<OrderElem[2][3]>(alloc, fill_row),
+               std::runtime_error);
+  EXPECT_EQ(stats.construct_calls, 4U);
+  EXPECT_EQ(stats.destroy_calls, 4U);
+  EXPECT_EQ(stats.alloc_bytes, stats.dealloc_bytes);
+
+  stats = AllocStats{};
+  log = OrderLog{};
+  log.throw_on_id = 5;
+  EXPECT_THROW((void)allocate_shared<OrderElem[][3]>(alloc, 2U, fill_row),
+               std::runtime_error);
+  EXPECT_EQ(stats.construct_calls, 5U);
+  EXPECT_EQ(stats.destroy_calls, 5U);
+  EXPECT_EQ(stats.alloc_bytes, stats.dealloc_bytes);
+
+  // 3. `allocate_shared_for_overwrite` MUST default-initialize (`0` calls to
+  // `allocator_traits::construct`) and destroy via `std::destroy_at` (`0` calls
+  // to `allocator_traits::destroy`) per C++20 [util.smartptr.shared.create].
+  stats = AllocStats{};
+  log = OrderLog{};
+  {
+    auto ov_scalar = allocate_shared_for_overwrite<OrderElem>(alloc);
+    EXPECT_EQ(ov_scalar->val, 11);
+    auto ov_b2d = allocate_shared_for_overwrite<OrderElem[2][3]>(alloc);
+    ov_b2d[1][2].val = 99;
+    EXPECT_EQ(ov_b2d[1][2].val, 99);
+    auto ov_u1d = allocate_shared_for_overwrite<OrderElem[]>(alloc, 3U);
+    EXPECT_EQ(ov_u1d[2].val, 11);
+    auto ov_u2d = allocate_shared_for_overwrite<OrderElem[][3]>(alloc, 2U);
+    EXPECT_EQ(ov_u2d[1][1].val, 11);
+  }
+  EXPECT_EQ(stats.construct_calls, 0U);
+  EXPECT_EQ(stats.destroy_calls, 0U);
+  EXPECT_GT(stats.alloc_bytes, 0U);
+  EXPECT_EQ(stats.alloc_bytes, stats.dealloc_bytes);
+  EXPECT_EQ(log.ctors.size(), 16U);
+  EXPECT_EQ(log.dtors.size(), 16U);
+  OrderElem::g_log = nullptr;
+}
+
+TEST(SharedPtrTest, ConcurrentUnpromotedRetireVsReleaseAcquireOrdering) {
+  TrackedBase::reset_counts();
+  constexpr int kRounds = arch::kTsanEnabled ? 600 : 4000;
+  constexpr int kWorkers = 4;
+
+  struct SlotItem {
+    std::atomic<bool> ready{false};
+    SharedPtr<TrackedBase> slots[kWorkers];
+    SharedPtr<TrackedBase> retiree;
+  };
+
+  auto items = std::make_unique<SlotItem[]>(static_cast<std::size_t>(kRounds));
+  for (int i = 0; i < kRounds; ++i) {
+    auto root = make_shared<TrackedBase>(1000 + i);
+    for (int w = 0; w < kWorkers; ++w) {
+      items[static_cast<std::size_t>(i)].slots[w] = root;
+    }
+    items[static_cast<std::size_t>(i)].retiree = std::move(root);
+    items[static_cast<std::size_t>(i)].ready.store(true,
+                                                   std::memory_order_release);
+  }
+
+  std::atomic<int> start_gun{0};
+  std::vector<std::thread> threads;
+  // Thread 0 forces `retire_unpromoted_locked` (`kModeUnpromoted` ->
+  // `kModeAtomicRetired` after transferring `extra_refs` to `_M_use_count`)
+  // via `WeakPtr::lock()`, racing directly with `kWorkers` threads running
+  // inline `sp_release`!
+  threads.emplace_back([&]() {
+    start_gun.fetch_add(1, std::memory_order_acq_rel);
+    unsigned int spins = 0U;
+    while (start_gun.load(std::memory_order_acquire) < kWorkers + 1) {
+      if ((++spins & 63U) == 0U) {
+        std::this_thread::yield();
+      } else {
+        arch::cpu_relax();
+      }
+    }
+    for (int i = 0; i < kRounds; ++i) {
+      auto& item = items[static_cast<std::size_t>(i)];
+      WeakPtr<TrackedBase> wp(item.retiree);
+      auto locked = wp.lock();
+      ASSERT_NE(locked.get(), nullptr);
+      EXPECT_EQ(locked->base_val, 1000 + i);
+      locked.reset();
+      item.retiree.reset();
+    }
+  });
+
+  for (int w = 0; w < kWorkers; ++w) {
+    threads.emplace_back([&, w]() {
+      start_gun.fetch_add(1, std::memory_order_acq_rel);
+      unsigned int spins = 0U;
+      while (start_gun.load(std::memory_order_acquire) < kWorkers + 1) {
+        if ((++spins & 63U) == 0U) {
+          std::this_thread::yield();
+        } else {
+          arch::cpu_relax();
+        }
+      }
+      for (int i = 0; i < kRounds; ++i) {
+        auto& item = items[static_cast<std::size_t>(i)];
+        EXPECT_EQ(item.slots[w]->base_val, 1000 + i);
+        item.slots[w].reset();
+      }
+    });
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+  items.reset();
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+  EXPECT_EQ(TrackedBase::dtors.load(), kRounds);
 }
 
 }  // namespace

@@ -180,11 +180,113 @@ struct SpRemoveCvTarget {
 
 template <typename U, std::size_t N>
 struct SpRemoveCvTarget<U[N]> {
-  using type = std::remove_cv_t<U>[N];
+  using type = typename SpRemoveCvTarget<U>::type[N];
+};
+
+template <typename U>
+struct SpRemoveCvTarget<U[]> {
+  using type = typename SpRemoveCvTarget<U>::type[];
 };
 
 template <typename T>
 using SpRemoveCvTargetT = typename SpRemoveCvTarget<T>::type;
+
+template <typename U>
+void sp_destroy_reverse(U* p) noexcept {
+  if constexpr (std::is_bounded_array_v<U>) {
+    using Sub = std::remove_extent_t<U>;
+    constexpr std::size_t kN = std::extent_v<U>;
+    auto* sub = reinterpret_cast<Sub*>(p);
+    for (std::size_t i = kN; i > 0U; --i) {
+      sp_destroy_reverse(sub + i - 1U);
+    }
+  } else {
+    std::destroy_at(p);
+  }
+}
+
+template <typename U, typename V>
+void sp_construct_copy_noalloc(U* dst, const V& src) {
+  if constexpr (std::is_bounded_array_v<U>) {
+    using Sub = std::remove_extent_t<U>;
+    constexpr std::size_t kN = std::extent_v<U>;
+    auto* sub = reinterpret_cast<Sub*>(dst);
+    std::size_t i = 0U;
+    try {
+      for (; i < kN; ++i) {
+        sp_construct_copy_noalloc(sub + i, src[i]);
+      }
+    } catch (...) {
+      while (i > 0U) {
+        --i;
+        sp_destroy_reverse(sub + i);
+      }
+      throw;
+    }
+  } else {
+    ::new (static_cast<void*>(dst)) U(src);
+  }
+}
+
+template <typename ValueAlloc, typename U>
+void sp_destroy_alloc_reverse(ValueAlloc& va, U* p) noexcept {
+  if constexpr (std::is_bounded_array_v<U>) {
+    using Sub = std::remove_extent_t<U>;
+    constexpr std::size_t kN = std::extent_v<U>;
+    auto* sub = reinterpret_cast<Sub*>(p);
+    for (std::size_t i = kN; i > 0U; --i) {
+      sp_destroy_alloc_reverse(va, sub + i - 1U);
+    }
+  } else {
+    std::allocator_traits<ValueAlloc>::destroy(va, p);
+  }
+}
+
+template <typename ValueAlloc, typename U>
+void sp_construct_val_alloc(ValueAlloc& va, U* p) {
+  if constexpr (std::is_bounded_array_v<U>) {
+    using Sub = std::remove_extent_t<U>;
+    constexpr std::size_t kN = std::extent_v<U>;
+    auto* sub = reinterpret_cast<Sub*>(p);
+    std::size_t i = 0U;
+    try {
+      for (; i < kN; ++i) {
+        sp_construct_val_alloc(va, sub + i);
+      }
+    } catch (...) {
+      while (i > 0U) {
+        --i;
+        sp_destroy_alloc_reverse(va, sub + i);
+      }
+      throw;
+    }
+  } else {
+    std::allocator_traits<ValueAlloc>::construct(va, p);
+  }
+}
+
+template <typename ValueAlloc, typename U, typename V>
+void sp_construct_copy_alloc(ValueAlloc& va, U* dst, const V& src) {
+  if constexpr (std::is_bounded_array_v<U>) {
+    using Sub = std::remove_extent_t<U>;
+    constexpr std::size_t kN = std::extent_v<U>;
+    auto* sub = reinterpret_cast<Sub*>(dst);
+    std::size_t i = 0U;
+    try {
+      for (; i < kN; ++i) {
+        sp_construct_copy_alloc(va, sub + i, src[i]);
+      }
+    } catch (...) {
+      while (i > 0U) {
+        --i;
+        sp_destroy_alloc_reverse(va, sub + i);
+      }
+      throw;
+    }
+  } else {
+    std::allocator_traits<ValueAlloc>::construct(va, dst, src);
+  }
+}
 
 THETA_FORCE_INLINE void sp_add_ref(StdSpCountedBase* pi) noexcept {
   if (pi == nullptr) {
@@ -234,9 +336,9 @@ THETA_FORCE_INLINE void sp_release(StdSpCountedBase* pi) noexcept {
   auto* cb = static_cast<ThetaSpCountedBase*>(pi);
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
     !THETA_TSAN_ENABLED
-  std::uint64_t hdr64 = 0ULL;
-  std::memcpy(&hdr64, &cb->fast_, sizeof(hdr64));
-  std::atomic_signal_fence(std::memory_order_acquire);
+  using FastHdrWord [[gnu::may_alias]] = std::uint64_t;
+  const std::uint64_t hdr64 = __atomic_load_n(
+      reinterpret_cast<const FastHdrWord*>(&cb->fast_), __ATOMIC_ACQUIRE);
   if ((hdr64 & (0xFFULL << 32U)) != 0ULL) [[likely]] {
     if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
       return;
@@ -353,20 +455,22 @@ struct SpInplaceStorage final {
   // Bounded-array value fill (`make_shared<U[N]>(const U& val)`)
   template <typename Elem>
     requires(std::is_bounded_array_v<T> &&
-             std::is_same_v<Elem, std::remove_extent_t<T>>)
+             std::is_same_v<SpRemoveCvTargetT<Elem>,
+                            SpRemoveCvTargetT<std::remove_extent_t<T>>>)
   SpInplaceStorage(ForOverwriteTag, const Elem& fill_val)
       : base(ops_or_size_value()) {
+    using TargetElem = std::remove_extent_t<T>;
     constexpr std::size_t kCount = std::extent_v<T>;
-    auto* arr = reinterpret_cast<Elem*>(storage);
+    auto* arr = reinterpret_cast<TargetElem*>(storage);
     std::size_t i = 0U;
     try {
       for (; i < kCount; ++i) {
-        ::new (static_cast<void*>(arr + i)) Elem(fill_val);
+        sp_construct_copy_noalloc(arr + i, fill_val);
       }
     } catch (...) {
       while (i > 0U) {
         --i;
-        arr[i].~Elem();
+        sp_destroy_reverse(arr + i);
       }
       throw;
     }
@@ -382,17 +486,17 @@ struct SpInplaceStorage final {
   }
 
   static void dispose_object(SpInplaceStorage* self) noexcept {
-    if constexpr (std::is_bounded_array_v<T>) {
-      using Elem = std::remove_extent_t<T>;
-      if constexpr (!std::is_trivially_destructible_v<Elem>) {
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+      if constexpr (std::is_bounded_array_v<T>) {
+        using Elem = std::remove_extent_t<T>;
         constexpr std::size_t kCount = std::extent_v<T>;
         auto* arr = std::launder(reinterpret_cast<Elem*>(self->storage));
         for (std::size_t i = kCount; i > 0U; --i) {
-          arr[i - 1U].~Elem();
+          sp_destroy_reverse(arr + i - 1U);
         }
+      } else {
+        std::destroy_at(self->ptr());
       }
-    } else if constexpr (!std::is_trivially_destructible_v<T>) {
-      self->ptr()->~T();
     }
   }
 
@@ -429,10 +533,11 @@ struct SpInplaceStorage final {
   }
 };
 
-template <typename T, typename Alloc>
+template <typename T, typename Alloc, bool kForOverwrite = false>
 struct SpAllocInplaceStorage final {
-  using ValueAlloc = typename std::allocator_traits<
-      Alloc>::template rebind_alloc<std::remove_cv_t<std::remove_extent_t<T>>>;
+  using Scalar = std::remove_cv_t<std::remove_all_extents_t<T>>;
+  using ValueAlloc =
+      typename std::allocator_traits<Alloc>::template rebind_alloc<Scalar>;
   ThetaSpCountedBase base;
   [[no_unique_address]] ValueAlloc alloc;
   alignas(T) unsigned char storage[sizeof(T)];
@@ -441,18 +546,21 @@ struct SpAllocInplaceStorage final {
       ValueAlloc>::template rebind_alloc<SpAllocInplaceStorage>;
 
   SpAllocInplaceStorage(const Alloc& a, ForOverwriteTag)
+    requires kForOverwrite
       : base(reinterpret_cast<std::uintptr_t>(&kOps)), alloc(a) {
     ::new (static_cast<void*>(storage)) T;
   }
 
   template <typename... Args>
-    requires(!(sizeof...(Args) == 1 &&
+    requires(!kForOverwrite &&
+             !(sizeof...(Args) == 1 &&
                (std::is_same_v<std::remove_cvref_t<Args>, ForOverwriteTag> &&
                 ...)))
   explicit SpAllocInplaceStorage(const Alloc& a, Args&&... args)
       : base(reinterpret_cast<std::uintptr_t>(&kOps)), alloc(a) {
     if constexpr (std::is_bounded_array_v<T>) {
-      ::new (static_cast<void*>(storage)) T();
+      static_assert(sizeof...(Args) == 0U);
+      sp_construct_val_alloc(alloc, reinterpret_cast<T*>(storage));
     } else {
       std::allocator_traits<ValueAlloc>::construct(
           alloc, reinterpret_cast<T*>(storage), std::forward<Args>(args)...);
@@ -460,21 +568,23 @@ struct SpAllocInplaceStorage final {
   }
 
   template <typename Elem>
-    requires(std::is_bounded_array_v<T> &&
-             std::is_same_v<Elem, std::remove_extent_t<T>>)
+    requires(!kForOverwrite && std::is_bounded_array_v<T> &&
+             std::is_same_v<SpRemoveCvTargetT<Elem>,
+                            SpRemoveCvTargetT<std::remove_extent_t<T>>>)
   SpAllocInplaceStorage(const Alloc& a, ForOverwriteTag, const Elem& fill_val)
       : base(reinterpret_cast<std::uintptr_t>(&kOps)), alloc(a) {
+    using TargetElem = std::remove_extent_t<T>;
     constexpr std::size_t kCount = std::extent_v<T>;
-    auto* arr = reinterpret_cast<Elem*>(storage);
+    auto* arr = reinterpret_cast<TargetElem*>(storage);
     std::size_t i = 0U;
     try {
       for (; i < kCount; ++i) {
-        std::allocator_traits<ValueAlloc>::construct(alloc, arr + i, fill_val);
+        sp_construct_copy_alloc(alloc, arr + i, fill_val);
       }
     } catch (...) {
       while (i > 0U) {
         --i;
-        std::allocator_traits<ValueAlloc>::destroy(alloc, arr + i);
+        sp_destroy_alloc_reverse(alloc, arr + i);
       }
       throw;
     }
@@ -490,12 +600,25 @@ struct SpAllocInplaceStorage final {
   }
 
   static void dispose_object(SpAllocInplaceStorage* self) noexcept {
-    if constexpr (std::is_bounded_array_v<T>) {
+    if constexpr (kForOverwrite) {
+      if constexpr (!std::is_trivially_destructible_v<T>) {
+        if constexpr (std::is_bounded_array_v<T>) {
+          using Elem = std::remove_extent_t<T>;
+          constexpr std::size_t kCount = std::extent_v<T>;
+          auto* arr = std::launder(reinterpret_cast<Elem*>(self->storage));
+          for (std::size_t i = kCount; i > 0U; --i) {
+            sp_destroy_reverse(arr + i - 1U);
+          }
+        } else {
+          std::destroy_at(self->ptr());
+        }
+      }
+    } else if constexpr (std::is_bounded_array_v<T>) {
       using Elem = std::remove_extent_t<T>;
       constexpr std::size_t kCount = std::extent_v<T>;
       auto* arr = std::launder(reinterpret_cast<Elem*>(self->storage));
       for (std::size_t i = kCount; i > 0U; --i) {
-        std::allocator_traits<ValueAlloc>::destroy(self->alloc, arr + i - 1U);
+        sp_destroy_alloc_reverse(self->alloc, arr + i - 1U);
       }
     } else {
       std::allocator_traits<ValueAlloc>::destroy(self->alloc, self->ptr());
@@ -531,10 +654,11 @@ struct SpAllocInplaceStorage final {
 
 // Single-allocation unbounded array control block (`make_shared<U[]>(n, ...)`
 // and `allocate_shared<U[]>(alloc, n, ...)`).
-template <typename Elem, typename Alloc>
+template <typename Elem, typename Alloc, bool kForOverwrite = false>
 struct SpUnboundedArrayStorage final {
+  using Scalar = std::remove_cv_t<std::remove_all_extents_t<Elem>>;
   using ValueAlloc =
-      typename std::allocator_traits<Alloc>::template rebind_alloc<Elem>;
+      typename std::allocator_traits<Alloc>::template rebind_alloc<Scalar>;
 
   static constexpr std::size_t kChunkAlign = alignof(Elem) >
                                                      alignof(std::max_align_t)
@@ -590,7 +714,11 @@ struct SpUnboundedArrayStorage final {
     } catch (...) {
       while (i > 0U) {
         --i;
-        std::allocator_traits<ValueAlloc>::destroy(self->alloc, arr + i);
+        if constexpr (kForOverwrite) {
+          sp_destroy_reverse(arr + i);
+        } else {
+          sp_destroy_alloc_reverse(self->alloc, arr + i);
+        }
       }
       self->~SpUnboundedArrayStorage();
       std::allocator_traits<ChunkAlloc>::deallocate(ca, mem, nchunks);
@@ -608,8 +736,16 @@ struct SpUnboundedArrayStorage final {
 
   static void dispose_elements(SpUnboundedArrayStorage* self) noexcept {
     Elem* arr = self->elems_ptr();
-    for (std::size_t i = self->count; i > 0U; --i) {
-      std::allocator_traits<ValueAlloc>::destroy(self->alloc, arr + i - 1U);
+    if constexpr (kForOverwrite) {
+      if constexpr (!std::is_trivially_destructible_v<Elem>) {
+        for (std::size_t i = self->count; i > 0U; --i) {
+          sp_destroy_reverse(arr + i - 1U);
+        }
+      }
+    } else {
+      for (std::size_t i = self->count; i > 0U; --i) {
+        sp_destroy_alloc_reverse(self->alloc, arr + i - 1U);
+      }
     }
   }
 
@@ -1311,11 +1447,14 @@ template <typename T, typename... Args>
 template <typename T>
   requires std::is_unbounded_array_v<T>
 [[nodiscard]] SharedPtr<T> make_shared(std::size_t n) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using Alloc = std::allocator<CleanElem>;
+  using CleanElem =
+      detail::shared_ptr::SpRemoveCvTargetT<std::remove_extent_t<T>>;
+  using Scalar = std::remove_all_extents_t<CleanElem>;
+  using Alloc = std::allocator<Scalar>;
   using Storage = detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc>;
-  auto* s = Storage::create(Alloc{}, n, [](Alloc& a, CleanElem* p) {
-    std::allocator_traits<Alloc>::construct(a, p);
+  using ValueAlloc = typename Storage::ValueAlloc;
+  auto* s = Storage::create(Alloc{}, n, [](ValueAlloc& va, CleanElem* p) {
+    detail::shared_ptr::sp_construct_val_alloc(va, p);
   });
   return SharedPtr<T>(s->elems_ptr(), &s->base,
                       detail::shared_ptr::AdoptRefTag{});
@@ -1325,11 +1464,14 @@ template <typename T>
   requires std::is_unbounded_array_v<T>
 [[nodiscard]] SharedPtr<T> make_shared(std::size_t n,
                                        const std::remove_extent_t<T>& u) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using Alloc = std::allocator<CleanElem>;
+  using CleanElem =
+      detail::shared_ptr::SpRemoveCvTargetT<std::remove_extent_t<T>>;
+  using Scalar = std::remove_all_extents_t<CleanElem>;
+  using Alloc = std::allocator<Scalar>;
   using Storage = detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc>;
-  auto* s = Storage::create(Alloc{}, n, [&u](Alloc& a, CleanElem* p) {
-    std::allocator_traits<Alloc>::construct(a, p, u);
+  using ValueAlloc = typename Storage::ValueAlloc;
+  auto* s = Storage::create(Alloc{}, n, [&u](ValueAlloc& va, CleanElem* p) {
+    detail::shared_ptr::sp_construct_copy_alloc(va, p, u);
   });
   return SharedPtr<T>(s->elems_ptr(), &s->base,
                       detail::shared_ptr::AdoptRefTag{});
@@ -1338,7 +1480,7 @@ template <typename T>
 template <typename T>
   requires std::is_bounded_array_v<T>
 [[nodiscard]] SharedPtr<T> make_shared() {
-  using CleanT = std::remove_cv_t<T>;
+  using CleanT = detail::shared_ptr::SpRemoveCvTargetT<T>;
   using Storage = detail::shared_ptr::SpInplaceStorage<CleanT>;
   void* mem = Storage::alloc_raw();
   try {
@@ -1353,8 +1495,7 @@ template <typename T>
 template <typename T>
   requires std::is_bounded_array_v<T>
 [[nodiscard]] SharedPtr<T> make_shared(const std::remove_extent_t<T>& u) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using CleanT = CleanElem[std::extent_v<T>];
+  using CleanT = detail::shared_ptr::SpRemoveCvTargetT<T>;
   using Storage = detail::shared_ptr::SpInplaceStorage<CleanT>;
   void* mem = Storage::alloc_raw();
   try {
@@ -1388,10 +1529,15 @@ template <typename T>
 template <typename T>
   requires std::is_unbounded_array_v<T>
 [[nodiscard]] SharedPtr<T> make_shared_for_overwrite(std::size_t n) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using Alloc = std::allocator<CleanElem>;
-  using Storage = detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc>;
-  auto* s = Storage::create(Alloc{}, n, [](Alloc&, CleanElem* p) {
+  using CleanElem =
+      detail::shared_ptr::SpRemoveCvTargetT<std::remove_extent_t<T>>;
+  using Scalar = std::remove_all_extents_t<CleanElem>;
+  using Alloc = std::allocator<Scalar>;
+  using Storage =
+      detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc,
+                                                  /*kForOverwrite=*/true>;
+  using ValueAlloc = typename Storage::ValueAlloc;
+  auto* s = Storage::create(Alloc{}, n, [](ValueAlloc&, CleanElem* p) {
     ::new (static_cast<void*>(p)) CleanElem;
   });
   return SharedPtr<T>(s->elems_ptr(), &s->base,
@@ -1421,11 +1567,12 @@ template <typename T, typename Alloc, typename... Args>
 template <typename T, typename Alloc>
   requires std::is_unbounded_array_v<T>
 [[nodiscard]] SharedPtr<T> allocate_shared(const Alloc& alloc, std::size_t n) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
+  using CleanElem =
+      detail::shared_ptr::SpRemoveCvTargetT<std::remove_extent_t<T>>;
   using Storage = detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc>;
   using ValueAlloc = typename Storage::ValueAlloc;
   auto* s = Storage::create(alloc, n, [](ValueAlloc& va, CleanElem* p) {
-    std::allocator_traits<ValueAlloc>::construct(va, p);
+    detail::shared_ptr::sp_construct_val_alloc(va, p);
   });
   return SharedPtr<T>(s->elems_ptr(), &s->base,
                       detail::shared_ptr::AdoptRefTag{});
@@ -1435,11 +1582,12 @@ template <typename T, typename Alloc>
   requires std::is_unbounded_array_v<T>
 [[nodiscard]] SharedPtr<T> allocate_shared(const Alloc& alloc, std::size_t n,
                                            const std::remove_extent_t<T>& u) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
+  using CleanElem =
+      detail::shared_ptr::SpRemoveCvTargetT<std::remove_extent_t<T>>;
   using Storage = detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc>;
   using ValueAlloc = typename Storage::ValueAlloc;
   auto* s = Storage::create(alloc, n, [&u](ValueAlloc& va, CleanElem* p) {
-    std::allocator_traits<ValueAlloc>::construct(va, p, u);
+    detail::shared_ptr::sp_construct_copy_alloc(va, p, u);
   });
   return SharedPtr<T>(s->elems_ptr(), &s->base,
                       detail::shared_ptr::AdoptRefTag{});
@@ -1448,8 +1596,7 @@ template <typename T, typename Alloc>
 template <typename T, typename Alloc>
   requires std::is_bounded_array_v<T>
 [[nodiscard]] SharedPtr<T> allocate_shared(const Alloc& alloc) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using CleanT = CleanElem[std::extent_v<T>];
+  using CleanT = detail::shared_ptr::SpRemoveCvTargetT<T>;
   using Storage = detail::shared_ptr::SpAllocInplaceStorage<CleanT, Alloc>;
   using SelfAlloc = typename Storage::SelfAlloc;
   SelfAlloc sa(alloc);
@@ -1467,8 +1614,7 @@ template <typename T, typename Alloc>
   requires std::is_bounded_array_v<T>
 [[nodiscard]] SharedPtr<T> allocate_shared(const Alloc& alloc,
                                            const std::remove_extent_t<T>& u) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using CleanT = CleanElem[std::extent_v<T>];
+  using CleanT = detail::shared_ptr::SpRemoveCvTargetT<T>;
   using Storage = detail::shared_ptr::SpAllocInplaceStorage<CleanT, Alloc>;
   using SelfAlloc = typename Storage::SelfAlloc;
   SelfAlloc sa(alloc);
@@ -1487,7 +1633,9 @@ template <typename T, typename Alloc>
   requires(!std::is_unbounded_array_v<T>)
 [[nodiscard]] SharedPtr<T> allocate_shared_for_overwrite(const Alloc& alloc) {
   using CleanT = detail::shared_ptr::SpRemoveCvTargetT<T>;
-  using Storage = detail::shared_ptr::SpAllocInplaceStorage<CleanT, Alloc>;
+  using Storage =
+      detail::shared_ptr::SpAllocInplaceStorage<CleanT, Alloc,
+                                                /*kForOverwrite=*/true>;
   using SelfAlloc = typename Storage::SelfAlloc;
   SelfAlloc sa(alloc);
   Storage* mem = std::allocator_traits<SelfAlloc>::allocate(sa, 1U);
@@ -1509,8 +1657,11 @@ template <typename T, typename Alloc>
   requires std::is_unbounded_array_v<T>
 [[nodiscard]] SharedPtr<T> allocate_shared_for_overwrite(const Alloc& alloc,
                                                          std::size_t n) {
-  using CleanElem = std::remove_cv_t<std::remove_extent_t<T>>;
-  using Storage = detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc>;
+  using CleanElem =
+      detail::shared_ptr::SpRemoveCvTargetT<std::remove_extent_t<T>>;
+  using Storage =
+      detail::shared_ptr::SpUnboundedArrayStorage<CleanElem, Alloc,
+                                                  /*kForOverwrite=*/true>;
   using ValueAlloc = typename Storage::ValueAlloc;
   auto* s = Storage::create(alloc, n, [](ValueAlloc&, CleanElem* p) {
     ::new (static_cast<void*>(p)) CleanElem;
