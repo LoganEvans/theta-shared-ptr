@@ -51,8 +51,8 @@ inline constexpr std::uint8_t kModeAtomicRetired = 2U;
 // `SpFastHeader::slot_id` (`0x40000000 | (copies << 16) | extra_refs`: `0`
 // per-CPU slots, `0 B` slab RSS, `0` `lock_cb` spinlocks, `0` `SYS_membarrier`
 // IPIs on cross-CPU teardown) before promoting to `kModePerCpuActive` on copy
-// `#8`.
-inline constexpr std::uint32_t kPromotionWarmupCopies = 8U;
+// `#64` (amortizing the ~2.5 us teardown `SYS_membarrier` across >= 64 copies).
+inline constexpr std::uint32_t kPromotionWarmupCopies = 64U;
 inline constexpr std::uint32_t kWarmupActiveBit = 0x40000000U;
 inline constexpr std::uint32_t kWarmupSealedBit = 0x80000000U;
 inline constexpr std::uint32_t kWarmupTagMask = 0xC0000000U;

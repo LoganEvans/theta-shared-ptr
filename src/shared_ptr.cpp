@@ -38,7 +38,7 @@ constinit void** g_rseq_keepalive_ptrs = nullptr;
 namespace {
 
 inline constexpr std::int64_t kPinnedTicketCushion = 1024;
-inline constexpr std::uint32_t kAtomicPinWarmupReads = 8U;
+inline constexpr std::uint32_t kAtomicPinWarmupReads = 2U;
 
 struct alignas(64) PerCpuSlotMeta {
   std::atomic<std::int64_t> central_tickets{0};
@@ -96,8 +96,8 @@ void note_harvest_membarrier(std::uint32_t weight) noexcept {
   } else {
     const std::uint32_t c =
         g_mb_burst_count.fetch_add(weight, std::memory_order_relaxed) + weight;
-    if (c >= 512U) {
-      g_mb_storm_until_ms.store(now + 250ULL, std::memory_order_relaxed);
+    if (c >= 1024U) {
+      g_mb_storm_until_ms.store(now + 50ULL, std::memory_order_relaxed);
     }
   }
 }
@@ -782,7 +782,7 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   }
 
   __atomic_store_n(&cb->fast_.fast_active, 0U, __ATOMIC_RELEASE);
-  quiesce_rseq_for_cb_locked(&meta, meta.keepalive_ptr_set == 0U ? 2U : 1U);
+  quiesce_rseq_for_cb_locked(&meta, meta.keepalive_ptr_set == 0U ? 4U : 1U);
 
   const std::uint32_t n_cpus = meta.num_reg_cpus;
   std::int64_t delta_sum = 0;
@@ -1212,7 +1212,7 @@ sp_keepalive_unpinned_sentinel() noexcept {
   }
 
   const std::int64_t h_after = rem + delta_sum;
-  if (h_after <= 0) {
+  if (h_after <= 0 || meta.pin_count == 0U) {
 #pragma clang loop vectorize(disable) unroll(disable)
     for (std::uint32_t i = 0U; i < n_cpus; ++i) {
       const std::uint16_t c = get_reg_cpu_locked(meta, i);
@@ -1222,12 +1222,18 @@ sp_keepalive_unpinned_sentinel() noexcept {
     }
     meta.num_reg_cpus = 0U;
     meta.central_tickets.store(0, std::memory_order_relaxed);
-    if (__atomic_load_n(&old_cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) ==
-        0U) {
+    for (std::int64_t i = 0; i < h_after - 1; ++i) {
+      old_cb->_M_add_ref_copy();
+    }
+    if (h_after <= 0 && __atomic_load_n(&old_cb->fast_.has_weak_or_std,
+                                        __ATOMIC_ACQUIRE) == 0U) {
       __atomic_store_n(&old_cb->fast_.slot_id, kWarmupSealedBit,
                        __ATOMIC_RELAXED);
       free_rseq_slot(slot);
     } else {
+      // Preserve Slot Lifetime Exclusivity (`g_rseq_keepalive_ptrs[slot]`
+      // remains valid until all `h_after` in-flight readers drop their strong
+      // refs and `_M_destroy()` recycles `slot`).
       __atomic_store_n(&old_cb->fast_.slot_id, slot | kWarmupSealedBit,
                        __ATOMIC_RELAXED);
     }
@@ -1235,7 +1241,9 @@ sp_keepalive_unpinned_sentinel() noexcept {
     unlock_cb(old_cb);
 
     old_cb->_M_weak_release();
-    old_cb->_M_release();
+    if (h_after <= 0) {
+      old_cb->_M_release();
+    }
     return;
   }
 

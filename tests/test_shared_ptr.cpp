@@ -932,7 +932,8 @@ TEST(SharedPtrTest, NamespaceThetaAtomicAliases) {
 
 TEST(SharedPtrTest, LockFreeInlineWarmupAndInteropTransitions) {
   TrackedBase::reset_counts();
-  for (int max_copies = 1; max_copies <= 10; ++max_copies) {
+  constexpr std::array<int, 8> kCopyCounts{1, 2, 7, 16, 31, 63, 64, 66};
+  for (int max_copies : kCopyCounts) {
     auto root = make_shared<TrackedBase>(100 + max_copies);
     EXPECT_EQ(root.use_count(), 1L);
 
@@ -964,7 +965,7 @@ TEST(SharedPtrTest, LockFreeInlineWarmupAndInteropTransitions) {
     EXPECT_TRUE(wp.expired());
   }
   EXPECT_EQ(TrackedBase::live.load(), 0);
-  EXPECT_EQ(TrackedBase::dtors.load(), 10);
+  EXPECT_EQ(TrackedBase::dtors.load(), static_cast<int>(kCopyCounts.size()));
 }
 
 TEST(SharedPtrTest, BurstyKeepAliveAndAtomicReloadStormThrottlesAndRecovers) {
@@ -994,20 +995,31 @@ TEST(SharedPtrTest, BurstyKeepAliveAndAtomicReloadStormThrottlesAndRecovers) {
       });
     }
 
-    // Drive > 600 rapid multi-CPU updates to trip `in_membarrier_storm()` and
+    // Drive > 1,100 rapid multi-CPU updates to trip `in_membarrier_storm()` and
     // exercise unpinned fallback under concurrent readers.
-    const int burst_iters = arch::kTsanEnabled ? 200 : 750;
+    const int burst_iters = arch::kTsanEnabled ? 200 : 1200;
     for (int gen = 2; gen <= burst_iters + 1; ++gen) {
       (void)ka.reset(make_shared<TrackedBase>(gen));
       atom.store(make_shared<TrackedBase>(gen), std::memory_order_release);
     }
 
-    // Wait past the 250 ms storm cooldown and verify readers cleanly re-pin
-    // onto the `rseq` fast path without requiring any further writer `store()`.
-    std::this_thread::sleep_for(std::chrono::milliseconds(280));
-    for (int i = 0; i < 64; ++i) {
+    // Wait past the 50 ms storm cooldown and verify readers cleanly re-pin
+    // onto the `rseq` fast path without requiring any further writer `store()`,
+    // then exercise steady pinned reloads (`h_after > 0` Slot Lifetime
+    // Exclusivity while `g_rseq_keepalive_ptrs[slot]` is dereferenced).
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    for (int i = 0; i < 96; ++i) {
       EXPECT_EQ(ka.get()->base_val, burst_iters + 1);
       EXPECT_EQ(atom.load()->base_val, burst_iters + 1);
+    }
+    const int steady_iters = arch::kTsanEnabled ? 80 : 350;
+    for (int i = 1; i <= steady_iters; ++i) {
+      const int val = burst_iters + 1 + i;
+      (void)ka.reset(make_shared<TrackedBase>(val));
+      atom.store(make_shared<TrackedBase>(val), std::memory_order_release);
+      for (int spin = 0; spin < 128; ++spin) {
+        arch::cpu_relax();
+      }
     }
 
     stop.store(true, std::memory_order_release);
