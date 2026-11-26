@@ -19,7 +19,7 @@
 //      Sole-owner pointers (`0` copies, incl. cross-CPU `std::move`) stay in
 //      `kModeUnpromoted` and destroy with `0` atomic RMWs and `0` virtual
 //      calls. Ephemeral shared pointers (`1 .. 7` copies, e.g. cross-CPU RPC
-//      or queue handoffs) stay in `kModeWarmup` inline inside `SpFastHeader`,
+//      or queue handoffs) stay unpromoted with lockless inline `slot_id` CAS,
 //      allocating `0` per-CPU slots, faulting `0` slab pages, and firing `0`
 //      `SYS_membarrier` IPIs on cross-CPU teardown.
 //   4. Promoted (`>= 8` copies) pointers & `KeepAlive<T>` (`MAP_NORESERVE`):
@@ -86,6 +86,13 @@ struct OwnerLess;
 template <typename T>
 class KeepAlive;
 
+// Primary `16 B` wait-free `rseq` concurrent atomic smart-pointer aliases
+template <typename T>
+using AtomicSharedPtr = std::atomic<SharedPtr<T>>;
+
+template <typename T>
+using AtomicWeakPtr = std::atomic<WeakPtr<T>>;
+
 // STL-compatible snake_case drop-in aliases
 // (`s/std::shared_ptr/theta::shared_ptr/`)
 template <typename T>
@@ -93,6 +100,12 @@ using shared_ptr = SharedPtr<T>;
 
 template <typename T>
 using weak_ptr = WeakPtr<T>;
+
+template <typename T>
+using atomic_shared_ptr = std::atomic<SharedPtr<T>>;
+
+template <typename T>
+using atomic_weak_ptr = std::atomic<WeakPtr<T>>;
 
 template <typename T>
 using enable_shared_from_this = EnableSharedFromThis<T>;
@@ -177,14 +190,35 @@ THETA_FORCE_INLINE void sp_add_ref(StdSpCountedBase* pi) noexcept {
   if (pi == nullptr) {
     return;
   }
-  if (is_theta_sp(pi)) [[likely]] {
-    auto* cb = static_cast<ThetaSpCountedBase*>(pi);
-    if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U)
-        [[likely]] {
-      if (ArchBackend::try_rseq_inc(&cb->fast_)) [[likely]] {
+  if (!is_theta_sp(pi)) [[unlikely]] {
+    pi->_M_add_ref_copy();
+    return;
+  }
+  auto* cb = static_cast<ThetaSpCountedBase*>(pi);
+  if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U)
+      [[likely]] {
+    if (ArchBackend::try_rseq_inc(&cb->fast_)) [[likely]] {
+      return;
+    }
+    sp_add_ref_slow(pi);
+    return;
+  }
+  const std::uint8_t mode = __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE);
+  if (mode == kModeUnpromoted) [[likely]] {
+    std::uint32_t w = __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
+    while (w == 0U || ((w - kWarmupCopyBase) < kWarmupCopyRange &&
+                       (w & 0xFFFFU) < 0xFFFEU)) [[likely]] {
+      const std::uint32_t next_w =
+          (w == 0U) ? kWarmupFirstCopyWord : (w + 0x00010001U);
+      if (__atomic_compare_exchange_n(&cb->fast_.slot_id, &w, next_w, true,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+          [[likely]] {
         return;
       }
     }
+  } else if (mode == kModeAtomicRetired) {
+    pi->_M_add_ref_copy();
+    return;
   }
   sp_add_ref_slow(pi);
 }
@@ -193,51 +227,82 @@ THETA_FORCE_INLINE void sp_release(StdSpCountedBase* pi) noexcept {
   if (pi == nullptr) {
     return;
   }
-  if (is_theta_sp(pi)) [[likely]] {
-    auto* cb = static_cast<ThetaSpCountedBase*>(pi);
+  if (!is_theta_sp(pi)) [[unlikely]] {
+    pi->_M_release();
+    return;
+  }
+  auto* cb = static_cast<ThetaSpCountedBase*>(pi);
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) && \
     !THETA_TSAN_ENABLED
-    std::uint64_t hdr64 = 0ULL;
-    std::memcpy(&hdr64, &cb->fast_, sizeof(hdr64));
-    std::atomic_signal_fence(std::memory_order_acquire);
-    if ((hdr64 & (0xFFULL << 32U)) != 0ULL) [[likely]] {
-      if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
-        return;
-      }
-      sp_release_slow(pi);
+  std::uint64_t hdr64 = 0ULL;
+  std::memcpy(&hdr64, &cb->fast_, sizeof(hdr64));
+  std::atomic_signal_fence(std::memory_order_acquire);
+  if ((hdr64 & (0xFFULL << 32U)) != 0ULL) [[likely]] {
+    if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
       return;
     }
-    if ((hdr64 & (0x00FFFFFFULL << 32U)) == 0ULL) [[likely]] {
-      const std::uintptr_t tag = cb->ops_or_size_;
-      if ((tag & 1U) != 0U) [[likely]] {
-        ::operator delete(static_cast<void*>(cb), tag >> 1U);
-      } else {
-        reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
-      }
-      return;
-    }
-#else
-    if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U)
-        [[likely]] {
-      if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
-        return;
-      }
-      sp_release_slow(pi);
-      return;
-    }
-    if (__atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE) == kModeUnpromoted &&
-        __atomic_load_n(&cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) == 0U)
-        [[likely]] {
-      const std::uintptr_t tag = cb->ops_or_size_;
-      if ((tag & 1U) != 0U) [[likely]] {
-        ::operator delete(static_cast<void*>(cb), tag >> 1U);
-      } else {
-        reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
-      }
-      return;
-    }
-#endif
+    sp_release_slow(pi);
+    return;
   }
+  if (hdr64 == 0ULL) [[likely]] {
+    const std::uintptr_t tag = cb->ops_or_size_;
+    if ((tag & 1U) != 0U) [[likely]] {
+      ::operator delete(static_cast<void*>(cb), tag >> 1U);
+    } else {
+      reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
+    }
+    return;
+  }
+  const auto mode = static_cast<std::uint8_t>((hdr64 >> 40U) & 0xFFULL);
+  if (mode == kModeUnpromoted) [[likely]] {
+    auto w = static_cast<std::uint32_t>(hdr64);
+    while ((w & kWarmupTagMask) == kWarmupActiveBit && (w & 0xFFFFU) != 0U)
+        [[likely]] {
+      if (__atomic_compare_exchange_n(&cb->fast_.slot_id, &w, w - 1U, true,
+                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+          [[likely]] {
+        return;
+      }
+    }
+  } else if (mode == kModeAtomicRetired) {
+    pi->_M_release();
+    return;
+  }
+#else
+  if (__atomic_load_n(&cb->fast_.fast_active, __ATOMIC_RELAXED) != 0U)
+      [[likely]] {
+    if (ArchBackend::try_rseq_dec(&cb->fast_)) [[likely]] {
+      return;
+    }
+    sp_release_slow(pi);
+    return;
+  }
+  const std::uint8_t mode = __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE);
+  if (mode == kModeUnpromoted) [[likely]] {
+    std::uint32_t w = __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_ACQUIRE);
+    if (w == 0U && __atomic_load_n(&cb->fast_.has_weak_or_std,
+                                   __ATOMIC_ACQUIRE) == 0U) [[likely]] {
+      const std::uintptr_t tag = cb->ops_or_size_;
+      if ((tag & 1U) != 0U) [[likely]] {
+        ::operator delete(static_cast<void*>(cb), tag >> 1U);
+      } else {
+        reinterpret_cast<const SpColdOps*>(tag)->dispose_and_destroy(cb);
+      }
+      return;
+    }
+    while ((w & kWarmupTagMask) == kWarmupActiveBit && (w & 0xFFFFU) != 0U)
+        [[likely]] {
+      if (__atomic_compare_exchange_n(&cb->fast_.slot_id, &w, w - 1U, true,
+                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED))
+          [[likely]] {
+        return;
+      }
+    }
+  } else if (mode == kModeAtomicRetired) {
+    pi->_M_release();
+    return;
+  }
+#endif
   sp_release_slow(pi);
 }
 
@@ -2037,13 +2102,21 @@ class KeepAlive {
     if (next.pi_ != nullptr) {
       void* raw_managed =
           const_cast<void*>(static_cast<const volatile void*>(next.get()));
-      if (!detail::shared_ptr::is_theta_sp(next.pi_) ||
-          !detail::shared_ptr::sp_pin_for_keepalive(
-              static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_),
-              raw_managed)) [[unlikely]] {
+      if (!detail::shared_ptr::is_theta_sp(next.pi_)) [[unlikely]] {
         new_cb = wrap_and_pin_cold(next, raw_managed);
       } else {
-        new_cb = static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
+        auto* cand =
+            static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
+        const auto pin_res =
+            detail::shared_ptr::sp_pin_for_keepalive(cand, raw_managed);
+        if (pin_res == detail::shared_ptr::SpPinResult::kPinned) [[likely]] {
+          new_cb = cand;
+        } else if (pin_res ==
+                   detail::shared_ptr::SpPinResult::kThrottledStorm) {
+          new_cb = detail::shared_ptr::sp_keepalive_unpinned_sentinel();
+        } else {
+          new_cb = wrap_and_pin_cold(next, raw_managed);
+        }
       }
     }
 
@@ -2057,13 +2130,16 @@ class KeepAlive {
       anchor_ = std::move(next);
       ret = anchor_;
     }
-    if (old_cb != nullptr && old_anchor.pi_ == old_cb) [[likely]] {
+    detail::shared_ptr::ThetaSpCountedBase* const sentinel =
+        detail::shared_ptr::sp_keepalive_unpinned_sentinel();
+    if (old_cb != nullptr && old_cb != sentinel && old_anchor.pi_ == old_cb)
+        [[likely]] {
       old_anchor.ptr_ = nullptr;
       old_anchor.pi_ = nullptr;
       detail::shared_ptr::sp_unpin_and_retire_old(
           old_cb, /*drop_anchor_ref=*/true,
           /*quiesce_readers=*/(old_cb != new_cb));
-    } else if (old_cb != nullptr) {
+    } else if (old_cb != nullptr && old_cb != sentinel) {
       detail::shared_ptr::sp_unpin_and_retire_old(
           old_cb, /*drop_anchor_ref=*/false,
           /*quiesce_readers=*/(old_cb != new_cb));
@@ -2108,27 +2184,66 @@ class KeepAlive {
     }
     auto* new_cb =
         static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
-    if (!detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed)) {
+    auto pin_res =
+        detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed);
+    if (pin_res == detail::shared_ptr::SpPinResult::kAliasConflict) {
       SharedPtr<T> hold_inner = std::move(next);
       element_type* raw_p = hold_inner.get();
       next = SharedPtr<T>(raw_p, [hold = std::move(hold_inner)](
                                      element_type*) mutable { hold.reset(); });
       new_cb = static_cast<detail::shared_ptr::ThetaSpCountedBase*>(next.pi_);
-      (void)detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed);
+      pin_res = detail::shared_ptr::sp_pin_for_keepalive(new_cb, raw_managed);
     }
-    return new_cb;
+    if (pin_res == detail::shared_ptr::SpPinResult::kPinned) {
+      return new_cb;
+    }
+    return detail::shared_ptr::sp_keepalive_unpinned_sentinel();
   }
 
   [[gnu::noinline]] SharedPtr<T> get_slow() const noexcept {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (!anchor_) {
-      return SharedPtr<T>{};
+    detail::shared_ptr::ThetaSpCountedBase* const sentinel =
+        detail::shared_ptr::sp_keepalive_unpinned_sentinel();
+    {
+      std::shared_lock<std::shared_mutex> lock(mutex_);
+      if (!anchor_) {
+        return SharedPtr<T>{};
+      }
+      if (__atomic_load_n(&active_cb_, __ATOMIC_ACQUIRE) != sentinel) {
+        if (detail::shared_ptr::is_theta_sp(anchor_.pi_)) {
+          auto* cb =
+              static_cast<detail::shared_ptr::ThetaSpCountedBase*>(anchor_.pi_);
+          detail::shared_ptr::sp_register_keepalive_cpu_slow(cb);
+        }
+        return anchor_;
+      }
+      if (detail::shared_ptr::sp_in_membarrier_storm() ||
+          !detail::shared_ptr::is_theta_sp(anchor_.pi_) ||
+          __atomic_load_n(
+              &static_cast<detail::shared_ptr::ThetaSpCountedBase*>(anchor_.pi_)
+                   ->fast_.mode,
+              __ATOMIC_ACQUIRE) == detail::shared_ptr::kModeAtomicRetired) {
+        return anchor_;
+      }
     }
-    if (detail::shared_ptr::is_theta_sp(anchor_.pi_)) {
-      auto* cb =
-          static_cast<detail::shared_ptr::ThetaSpCountedBase*>(anchor_.pi_);
-      detail::shared_ptr::sp_register_keepalive_cpu_slow(cb);
+    std::unique_lock<std::shared_mutex> wlock(mutex_, std::try_to_lock);
+    if (wlock.owns_lock()) {
+      if (!anchor_) {
+        return SharedPtr<T>{};
+      }
+      if (__atomic_load_n(&active_cb_, __ATOMIC_RELAXED) == sentinel &&
+          detail::shared_ptr::is_theta_sp(anchor_.pi_)) {
+        auto* cb =
+            static_cast<detail::shared_ptr::ThetaSpCountedBase*>(anchor_.pi_);
+        void* raw_managed =
+            const_cast<void*>(static_cast<const volatile void*>(anchor_.get()));
+        if (detail::shared_ptr::sp_pin_for_keepalive(cb, raw_managed) ==
+            detail::shared_ptr::SpPinResult::kPinned) {
+          __atomic_store_n(&active_cb_, cb, __ATOMIC_RELEASE);
+        }
+      }
+      return anchor_;
     }
+    std::shared_lock<std::shared_mutex> rlock(mutex_);
     return anchor_;
   }
 
@@ -2261,21 +2376,26 @@ struct atomic<::theta::SharedPtr<T>> {
         if (new_p == nullptr && new_pi == nullptr) {
           next_rep = 0ULL;
         } else {
-          bool pinned_new = false;
+          std::uintptr_t flags = kRepUnpinnedBit;
           if (was_pinned && new_p != nullptr &&
               ::theta::detail::shared_ptr::is_theta_sp(new_pi)) {
             auto* const new_cb =
                 static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
                     new_pi);
-            pinned_new =
+            const auto pin_res =
                 ::theta::detail::shared_ptr::sp_pin_for_keepalive(
                     new_cb, const_cast<void*>(
-                                static_cast<const volatile void*>(new_p))) &&
-                (__atomic_load_n(&new_cb->fast_.mode, __ATOMIC_ACQUIRE) ==
-                 ::theta::detail::shared_ptr::kModePerCpuActive);
+                                static_cast<const volatile void*>(new_p)));
+            if (pin_res == ::theta::detail::shared_ptr::SpPinResult::kPinned &&
+                __atomic_load_n(&new_cb->fast_.mode, __ATOMIC_ACQUIRE) ==
+                    ::theta::detail::shared_ptr::kModePerCpuActive) {
+              flags = 0ULL;
+            } else if (pin_res == ::theta::detail::shared_ptr::SpPinResult::
+                                      kAliasConflict) {
+              flags = kRepUnpinnedBit | kRepNoPinBit;
+            }
           }
-          next_rep = reinterpret_cast<std::uintptr_t>(new_pi) |
-                     (pinned_new ? 0ULL : kRepUnpinnedBit);
+          next_rep = reinterpret_cast<std::uintptr_t>(new_pi) | flags;
         }
         publish_rep_locked(next_rep, success);
       }
@@ -2434,21 +2554,26 @@ struct atomic<::theta::SharedPtr<T>> {
       if (new_p == nullptr && new_pi == nullptr) {
         next_rep = 0ULL;
       } else {
-        bool pinned_new = false;
+        std::uintptr_t flags = kRepUnpinnedBit;
         if (was_pinned && new_p != nullptr &&
             ::theta::detail::shared_ptr::is_theta_sp(new_pi)) {
           auto* const new_cb =
               static_cast<::theta::detail::shared_ptr::ThetaSpCountedBase*>(
                   new_pi);
-          pinned_new =
+          const auto pin_res =
               ::theta::detail::shared_ptr::sp_pin_for_keepalive(
-                  new_cb, const_cast<void*>(
-                              static_cast<const volatile void*>(new_p))) &&
-              (__atomic_load_n(&new_cb->fast_.mode, __ATOMIC_ACQUIRE) ==
-               ::theta::detail::shared_ptr::kModePerCpuActive);
+                  new_cb,
+                  const_cast<void*>(static_cast<const volatile void*>(new_p)));
+          if (pin_res == ::theta::detail::shared_ptr::SpPinResult::kPinned &&
+              __atomic_load_n(&new_cb->fast_.mode, __ATOMIC_ACQUIRE) ==
+                  ::theta::detail::shared_ptr::kModePerCpuActive) {
+            flags = 0ULL;
+          } else if (pin_res ==
+                     ::theta::detail::shared_ptr::SpPinResult::kAliasConflict) {
+            flags = kRepUnpinnedBit | kRepNoPinBit;
+          }
         }
-        next_rep = reinterpret_cast<std::uintptr_t>(new_pi) |
-                   (pinned_new ? 0ULL : kRepUnpinnedBit);
+        next_rep = reinterpret_cast<std::uintptr_t>(new_pi) | flags;
       }
       publish_rep_locked(next_rep, order);
     }

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -896,6 +897,125 @@ TEST(ConcurrencyStressTest, StdAtomicSharedPtrRseqPinningAliasingAndReloads) {
 
   EXPECT_EQ(TrackedBase::live.load(), 0);
   EXPECT_EQ(TrackedBase::dtors.load(), 120);
+}
+
+TEST(SharedPtrTest, NamespaceThetaAtomicAliases) {
+  static_assert(
+      std::is_same_v<AtomicSharedPtr<int>, std::atomic<SharedPtr<int>>>);
+  static_assert(
+      std::is_same_v<atomic_shared_ptr<int>, std::atomic<shared_ptr<int>>>);
+  static_assert(std::is_same_v<AtomicWeakPtr<int>, std::atomic<WeakPtr<int>>>);
+  static_assert(
+      std::is_same_v<atomic_weak_ptr<int>, std::atomic<weak_ptr<int>>>);
+  static_assert(sizeof(AtomicSharedPtr<int>) == 16U);
+  static_assert(sizeof(atomic_shared_ptr<int>) == 16U);
+  static_assert(sizeof(AtomicWeakPtr<int>) == 16U);
+  static_assert(sizeof(atomic_weak_ptr<int>) == 16U);
+
+  TrackedBase::reset_counts();
+  {
+    atomic_shared_ptr<TrackedBase> cell(make_shared<TrackedBase>(42));
+    AtomicWeakPtr<TrackedBase> wcell(WeakPtr<TrackedBase>(cell.load()));
+    EXPECT_EQ(cell.load()->base_val, 42);
+    auto locked = wcell.load().lock();
+    ASSERT_NE(locked.get(), nullptr);
+    EXPECT_EQ(locked->base_val, 42);
+
+    auto expected = cell.load();
+    auto next = make_shared<TrackedBase>(99);
+    EXPECT_TRUE(cell.compare_exchange_strong(expected, next));
+    EXPECT_EQ(cell.load()->base_val, 99);
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+  EXPECT_EQ(TrackedBase::dtors.load(), 2);
+}
+
+TEST(SharedPtrTest, LockFreeInlineWarmupAndInteropTransitions) {
+  TrackedBase::reset_counts();
+  for (int max_copies = 1; max_copies <= 10; ++max_copies) {
+    auto root = make_shared<TrackedBase>(100 + max_copies);
+    EXPECT_EQ(root.use_count(), 1L);
+
+    std::vector<SharedPtr<TrackedBase>> copies;
+    copies.reserve(static_cast<std::size_t>(max_copies));
+    for (int i = 0; i < max_copies; ++i) {
+      copies.push_back(root);
+      EXPECT_EQ(root.use_count(), static_cast<long>(i + 2));
+    }
+
+    WeakPtr<TrackedBase> wp(root);
+    auto from_weak = wp.lock();
+    ASSERT_NE(from_weak.get(), nullptr);
+    EXPECT_EQ(root.use_count(), static_cast<long>(max_copies + 2));
+    from_weak.reset();
+
+#if THETA_SHARED_PTR_HAS_GLIBCXX_ABI
+    if ((max_copies & 1) == 1) {
+      std::shared_ptr<TrackedBase> std_cp = root.to_std();
+      EXPECT_EQ(root.use_count(), static_cast<long>(max_copies + 2));
+      SharedPtr<TrackedBase> adopted(std::move(std_cp));
+      EXPECT_EQ(root.use_count(), static_cast<long>(max_copies + 2));
+    }
+#endif
+
+    copies.clear();
+    EXPECT_EQ(root.use_count(), 1L);
+    root.reset();
+    EXPECT_TRUE(wp.expired());
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+  EXPECT_EQ(TrackedBase::dtors.load(), 10);
+}
+
+TEST(SharedPtrTest, BurstyKeepAliveAndAtomicReloadStormThrottlesAndRecovers) {
+  TrackedBase::reset_counts();
+  {
+    KeepAlive<TrackedBase> ka(make_shared<TrackedBase>(1));
+    AtomicSharedPtr<TrackedBase> atom(make_shared<TrackedBase>(1));
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+      readers.emplace_back([&]() {
+        unsigned int iters = 0U;
+        while (!stop.load(std::memory_order_relaxed)) {
+          auto s1 = ka.get();
+          auto s2 = atom.load(std::memory_order_acquire);
+          ASSERT_NE(s1.get(), nullptr);
+          ASSERT_NE(s2.get(), nullptr);
+          ASSERT_GE(s1->base_val, 1);
+          ASSERT_GE(s2->base_val, 1);
+          if constexpr (arch::kTsanEnabled) {
+            if ((++iters & 31U) == 0U) {
+              std::this_thread::yield();
+            }
+          }
+        }
+      });
+    }
+
+    // Drive > 600 rapid multi-CPU updates to trip `in_membarrier_storm()` and
+    // exercise unpinned fallback under concurrent readers.
+    const int burst_iters = arch::kTsanEnabled ? 200 : 750;
+    for (int gen = 2; gen <= burst_iters + 1; ++gen) {
+      (void)ka.reset(make_shared<TrackedBase>(gen));
+      atom.store(make_shared<TrackedBase>(gen), std::memory_order_release);
+    }
+
+    // Wait past the 250 ms storm cooldown and verify readers cleanly re-pin
+    // onto the `rseq` fast path without requiring any further writer `store()`.
+    std::this_thread::sleep_for(std::chrono::milliseconds(280));
+    for (int i = 0; i < 64; ++i) {
+      EXPECT_EQ(ka.get()->base_val, burst_iters + 1);
+      EXPECT_EQ(atom.load()->base_val, burst_iters + 1);
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto& th : readers) {
+      th.join();
+    }
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
 }
 
 }  // namespace

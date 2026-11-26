@@ -25,6 +25,9 @@ struct ArchBackend {
     const std::int32_t cpu = current_cpu_id();
     const std::uint32_t slot =
         __atomic_load_n(&fast->slot_id, __ATOMIC_RELAXED);
+    if (slot == 0U || slot >= kMaxStripedSlots) {
+      return false;
+    }
     std::int64_t* const cell =
         base + (static_cast<std::size_t>(cpu) << kSlotShift) + slot;
     std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);
@@ -51,6 +54,9 @@ struct ArchBackend {
     const std::int32_t cpu = current_cpu_id();
     const std::uint32_t slot =
         __atomic_load_n(&fast->slot_id, __ATOMIC_RELAXED);
+    if (slot == 0U || slot >= kMaxStripedSlots) {
+      return false;
+    }
     std::int64_t* const cell =
         base + (static_cast<std::size_t>(cpu) << kSlotShift) + slot;
     std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);
@@ -90,6 +96,9 @@ struct ArchBackend {
     const std::int32_t cpu = current_cpu_id();
     const std::uint32_t slot =
         __atomic_load_n(&fast->slot_id, __ATOMIC_RELAXED);
+    if (slot == 0U || slot >= kMaxStripedSlots) {
+      return false;
+    }
     std::int64_t* const cell =
         base + (static_cast<std::size_t>(cpu) << kSlotShift) + slot;
     std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);

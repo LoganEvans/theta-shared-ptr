@@ -45,13 +45,22 @@ inline constexpr std::uint32_t kMaxStripedSlots = (1U << kSlotShift);
 inline constexpr std::uint8_t kModeUnpromoted = 0U;
 inline constexpr std::uint8_t kModePerCpuActive = 1U;
 inline constexpr std::uint8_t kModeAtomicRetired = 2U;
-inline constexpr std::uint8_t kModeWarmup = 3U;
 
 // Lazy per-object promotion warmup threshold: newly copied control blocks count
-// their first `1 .. kPromotionWarmupCopies - 1` copies inline inside
-// `SpFastHeader` (`0` per-CPU slots, `0 B` slab RSS, `0` `SYS_membarrier` IPIs
-// on cross-CPU teardown) before promoting to `kModePerCpuActive` on copy `#8`.
+// their first `1 .. kPromotionWarmupCopies - 1` copies locklessly inline inside
+// `SpFastHeader::slot_id` (`0x40000000 | (copies << 16) | extra_refs`: `0`
+// per-CPU slots, `0 B` slab RSS, `0` `lock_cb` spinlocks, `0` `SYS_membarrier`
+// IPIs on cross-CPU teardown) before promoting to `kModePerCpuActive` on copy
+// `#8`.
 inline constexpr std::uint32_t kPromotionWarmupCopies = 8U;
+inline constexpr std::uint32_t kWarmupActiveBit = 0x40000000U;
+inline constexpr std::uint32_t kWarmupSealedBit = 0x80000000U;
+inline constexpr std::uint32_t kWarmupTagMask = 0xC0000000U;
+inline constexpr std::uint32_t kWarmupFirstCopyWord =
+    kWarmupActiveBit | (1U << 16U) | 1U;
+inline constexpr std::uint32_t kWarmupCopyBase = kWarmupActiveBit | (1U << 16U);
+inline constexpr std::uint32_t kWarmupCopyRange = (kPromotionWarmupCopies - 2U)
+                                                  << 16U;
 
 // Standard-layout 8-byte hot header embedded inside `ThetaSpCountedBase` so
 // inline `rseq` assembly accesses `slot_id` (+0) and `fast_active` (+4) with
@@ -207,8 +216,16 @@ void sp_adopt_from_std_move(StdSpCountedBase* pi) noexcept;
 
 // KeepAlive & `rseq`-accelerated `std::atomic<SharedPtr<T>>` support on
 // `ThetaSpCountedBase`
-[[nodiscard]] bool sp_pin_for_keepalive(ThetaSpCountedBase* cb,
-                                        void* managed_ptr) noexcept;
+enum class SpPinResult : std::uint8_t {
+  kPinned = 0,
+  kThrottledStorm = 1,
+  kAliasConflict = 2,
+};
+
+[[nodiscard]] SpPinResult sp_pin_for_keepalive(ThetaSpCountedBase* cb,
+                                               void* managed_ptr) noexcept;
+[[nodiscard]] ThetaSpCountedBase* sp_keepalive_unpinned_sentinel() noexcept;
+[[nodiscard]] bool sp_in_membarrier_storm() noexcept;
 [[nodiscard]] bool sp_try_pin_atomic_fast(ThetaSpCountedBase* cb,
                                           void* managed_ptr,
                                           bool& out_never_pin) noexcept;
