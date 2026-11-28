@@ -2,9 +2,13 @@
 // Copyright (c) 2026 Logan Evans
 // SPDX-License-Identifier: MIT
 //
-// Pure C++23 portable runtime for `theta::portable::SharedPtr<T>`,
-// `AtomicSharedPtr<T>`, and `KeepAlive<T>` — zero `<sys/rseq.h>`, zero inline
-// assembly, zero `<pthread.h>`, and zero `SYS_membarrier` IPIs.
+// 2-Party Dekker Gate + Fused Hazard-Slot Runtime for `theta::portable`:
+//   - Dedicated per-thread `PortableThreadGate` (`[harvester_busy,
+//   owner_busy]`)
+//     and single-owner `slab[tid][slot]` cells (zero `CAS` on reader slabs).
+//   - `sp_acquire_pinned_under_hazard_slow` transfers `cb` to `cold_hazard_cb`
+//     before releasing `owner_busy`, keeping `owner_busy` strictly non-blocking
+//     (~5 instructions) while preventing deadlock with `lock_cb(cb)`.
 
 #include <algorithm>
 #include <atomic>
@@ -41,40 +45,33 @@ namespace {
 
 inline constexpr std::int64_t kPinnedTicketCushion = 1024;
 inline constexpr std::uint32_t kAtomicPinWarmupReads = 2U;
-inline constexpr std::uint32_t kMaxHazardRecords = 512U;
 
-struct alignas(64) HazardRecord {
-  std::atomic<const void*> protected_cb{nullptr};
-  std::atomic<bool> in_use{false};
-};
-
-struct alignas(64) PerStripeSlotMeta {
+struct alignas(64) PerThreadSlotMeta {
   std::atomic<std::int64_t> central_tickets{0};
   std::uint64_t last_harvest_ms{0};
   std::uint32_t rapid_harvest_streak{0};
-  std::uint32_t num_reg_stripes{0};
+  std::uint32_t num_reg_threads{0};
   std::uint32_t overflow_cap{0};
   std::atomic<std::uint32_t> pin_count{0};
   std::atomic<std::uint32_t> atomic_pin_reads{0};
   std::uint16_t quiescing_unpins{0};
   std::uint8_t keepalive_ptr_set{0};
   std::uint8_t pad_{0};
-  std::uint16_t inline_stripes[8]{};
-  std::uint16_t* overflow_stripes{nullptr};
+  std::uint16_t inline_threads[8]{};
+  std::uint16_t* overflow_threads{nullptr};
 };
 
-static_assert(sizeof(PerStripeSlotMeta) == 64);
+static_assert(sizeof(PerThreadSlotMeta) == 64);
 
 constinit std::int64_t* g_portable_slab_base = nullptr;
-constinit PerStripeSlotMeta* g_portable_slot_meta = nullptr;
+constinit PerThreadSlotMeta* g_portable_slot_meta = nullptr;
 constinit bool g_portable_slab_ok = false;
 
 constinit std::atomic<bool> g_runtime_ready{false};
 constinit std::atomic<bool> g_runtime_init_lock{false};
 
-constinit HazardRecord g_hazard_records[kMaxHazardRecords]{};
-constinit std::atomic<std::uint32_t> g_hazard_high_water{0U};
-constinit std::atomic<std::uint32_t> g_next_stripe{0U};
+constinit PortableThreadGate g_thread_gates[kMaxPortableThreads]{};
+constinit std::atomic<std::uint32_t> g_gate_high_water{0U};
 
 std::uint64_t coarse_monotonic_ms() noexcept {
 #if THETA_OS_LINUX
@@ -162,9 +159,9 @@ struct PodTlsSlotCache {
   static constexpr std::uint32_t kRefill = 16U;
 
   bool thread_exited;
-  bool stripe_assigned;
-  std::uint16_t stripe_id;
-  std::uint32_t hazard_idx;
+  bool init_attempted;
+  bool tid_assigned;
+  std::uint16_t tid;
   std::uint32_t slot_count;
   std::uint32_t slot_ids[kCap];
 };
@@ -190,12 +187,12 @@ struct PortableThreadExitCleaner {
                                            g_tls_cache.slot_count);
       g_tls_cache.slot_count = 0U;
     }
-    if (g_tls_cache.hazard_idx < kMaxHazardRecords) {
-      g_hazard_records[g_tls_cache.hazard_idx].protected_cb.store(
-          nullptr, std::memory_order_release);
-      g_hazard_records[g_tls_cache.hazard_idx].in_use.store(
-          false, std::memory_order_release);
-      g_tls_cache.hazard_idx = kMaxHazardRecords;
+    if (g_tls_cache.tid_assigned && g_tls_cache.tid < kMaxPortableThreads) {
+      PortableThreadGate& gate = g_thread_gates[g_tls_cache.tid];
+      gate.owner_busy.store(0U, std::memory_order_release);
+      gate.cold_hazard_cb.store(nullptr, std::memory_order_release);
+      gate.in_use.store(false, std::memory_order_release);
+      g_tls_cache.tid_assigned = false;
     }
   }
 };
@@ -215,15 +212,15 @@ void ensure_runtime_init() noexcept {
 
   if (!g_runtime_ready.load(std::memory_order_relaxed)) {
     const std::size_t total_cells =
-        static_cast<std::size_t>(kPortableNumStripes) * kMaxPortableSlots;
+        static_cast<std::size_t>(kMaxPortableThreads) * kMaxPortableSlots;
 
     if (g_portable_slab_base == nullptr) {
       g_portable_slab_base = static_cast<std::int64_t*>(
           map_portable_region(total_cells * sizeof(std::int64_t)));
     }
     if (g_portable_slot_meta == nullptr) {
-      g_portable_slot_meta = static_cast<PerStripeSlotMeta*>(
-          map_portable_region(kMaxPortableSlots * sizeof(PerStripeSlotMeta)));
+      g_portable_slot_meta = static_cast<PerThreadSlotMeta*>(
+          map_portable_region(kMaxPortableSlots * sizeof(PerThreadSlotMeta)));
     }
     if (g_portable_keepalive_ptrs == nullptr) {
       g_portable_keepalive_ptrs = static_cast<void**>(
@@ -249,44 +246,39 @@ void ensure_runtime_init() noexcept {
   ensure_runtime_init();
 }
 
-std::uint16_t ensure_thread_tls_initialized() noexcept {
+bool ensure_thread_tls_initialized(std::uint16_t& out_tid) noexcept {
   ensure_runtime_init();
   if (g_tls_cache.thread_exited || !g_portable_slab_ok) [[unlikely]] {
-    return 0U;
+    return false;
   }
-  if (!g_tls_cache.stripe_assigned) [[unlikely]] {
-    const std::uint16_t stripe = static_cast<std::uint16_t>(
-        g_next_stripe.fetch_add(1U, std::memory_order_relaxed) &
-        (kPortableNumStripes - 1U));
-    g_tls_cache.stripe_id = stripe;
-    g_tls_cache.stripe_assigned = true;
-    g_tls_cache.hazard_idx = kMaxHazardRecords;
-
-    for (std::uint32_t i = 0U; i < kMaxHazardRecords; ++i) {
+  if (!g_tls_cache.init_attempted) [[unlikely]] {
+    g_tls_cache.init_attempted = true;
+    for (std::uint32_t i = 0U; i < kMaxPortableThreads; ++i) {
       bool expected = false;
-      if (g_hazard_records[i].in_use.compare_exchange_strong(
+      if (g_thread_gates[i].in_use.compare_exchange_strong(
               expected, true, std::memory_order_acq_rel,
               std::memory_order_relaxed)) {
-        g_tls_cache.hazard_idx = i;
-        std::uint32_t hw = g_hazard_high_water.load(std::memory_order_relaxed);
-        while (i + 1U > hw && !g_hazard_high_water.compare_exchange_weak(
+        g_tls_cache.tid = static_cast<std::uint16_t>(i);
+        g_tls_cache.tid_assigned = true;
+        std::uint32_t hw = g_gate_high_water.load(std::memory_order_relaxed);
+        while (i + 1U > hw && !g_gate_high_water.compare_exchange_weak(
                                   hw, i + 1U, std::memory_order_release,
                                   std::memory_order_relaxed)) {
         }
+        g_portable_fast_tls.gate = &g_thread_gates[i];
+        g_portable_fast_tls.stripe_base =
+            g_portable_slab_base +
+            (static_cast<std::size_t>(i) << kPortableSlotShift);
+        g_thread_exit_cleaner.armed = true;
         break;
       }
     }
-
-    g_portable_fast_tls.stripe_base =
-        g_portable_slab_base +
-        (static_cast<std::size_t>(stripe) << kPortableSlotShift);
-    g_portable_fast_tls.hazard_ptr =
-        (g_tls_cache.hazard_idx < kMaxHazardRecords)
-            ? &g_hazard_records[g_tls_cache.hazard_idx].protected_cb
-            : nullptr;
-    g_thread_exit_cleaner.armed = true;
   }
-  return g_tls_cache.stripe_id;
+  if (!g_tls_cache.tid_assigned) [[unlikely]] {
+    return false;
+  }
+  out_tid = g_tls_cache.tid;
+  return true;
 }
 
 std::uint32_t alloc_portable_slot() noexcept {
@@ -296,7 +288,9 @@ std::uint32_t alloc_portable_slot() noexcept {
                                                                       : 0U;
   }
   if (g_tls_cache.slot_count == 0U) [[unlikely]] {
-    (void)ensure_thread_tls_initialized();
+    std::uint16_t dummy_tid = 0U;
+    (void)ensure_thread_tls_initialized(dummy_tid);
+    g_thread_exit_cleaner.armed = true;
     g_tls_cache.slot_count = g_portable_slot_alloc.alloc_from_global(
         g_tls_cache.slot_ids, PodTlsSlotCache::kRefill);
     if (g_tls_cache.slot_count == 0U) [[unlikely]] {
@@ -319,7 +313,7 @@ void free_portable_slot(std::uint32_t slot) noexcept {
     return;
   }
   if (g_tls_cache.slot_count == PodTlsSlotCache::kCap) [[unlikely]] {
-    (void)ensure_thread_tls_initialized();
+    g_thread_exit_cleaner.armed = true;
     g_portable_slot_alloc.free_to_global(g_tls_cache.slot_ids,
                                          PodTlsSlotCache::kRefill);
     std::memmove(g_tls_cache.slot_ids,
@@ -343,12 +337,12 @@ THETA_FORCE_INLINE void unlock_cb(PortableSpCountedBase* cb) noexcept {
   __atomic_store_n(&cb->fast_.reg_lock, 0U, __ATOMIC_RELEASE);
 }
 
-void append_reg_stripe_locked(PerStripeSlotMeta& meta,
-                              std::uint16_t stripe) noexcept {
-  const std::uint32_t n = meta.num_reg_stripes;
+void append_reg_thread_locked(PerThreadSlotMeta& meta,
+                              std::uint16_t tid) noexcept {
+  const std::uint32_t n = meta.num_reg_threads;
   if (n < 8U) [[likely]] {
-    meta.inline_stripes[n] = stripe;
-    meta.num_reg_stripes = n + 1U;
+    meta.inline_threads[n] = tid;
+    meta.num_reg_threads = n + 1U;
     return;
   }
   const std::uint32_t ext_idx = n - 8U;
@@ -356,55 +350,96 @@ void append_reg_stripe_locked(PerStripeSlotMeta& meta,
     const std::uint32_t new_cap =
         meta.overflow_cap == 0U
             ? 16U
-            : std::min<std::uint32_t>(kPortableNumStripes,
+            : std::min<std::uint32_t>(kMaxPortableThreads,
                                       meta.overflow_cap * 4U);
     auto* next_buf = new (std::nothrow) std::uint16_t[new_cap];
     if (next_buf == nullptr) [[unlikely]] {
       return;
     }
-    if (meta.overflow_stripes != nullptr) {
-      std::memcpy(next_buf, meta.overflow_stripes,
+    if (meta.overflow_threads != nullptr) {
+      std::memcpy(next_buf, meta.overflow_threads,
                   ext_idx * sizeof(std::uint16_t));
-      delete[] meta.overflow_stripes;
+      delete[] meta.overflow_threads;
     }
-    meta.overflow_stripes = next_buf;
+    meta.overflow_threads = next_buf;
     meta.overflow_cap = new_cap;
   }
-  meta.overflow_stripes[ext_idx] = stripe;
-  meta.num_reg_stripes = n + 1U;
+  meta.overflow_threads[ext_idx] = tid;
+  meta.num_reg_threads = n + 1U;
 }
 
-std::uint16_t get_reg_stripe_locked(const PerStripeSlotMeta& meta,
+std::uint16_t get_reg_thread_locked(const PerThreadSlotMeta& meta,
                                     std::uint32_t i) noexcept {
   if (i < 8U) [[likely]] {
-    return meta.inline_stripes[i];
+    return meta.inline_threads[i];
   }
-  return meta.overflow_stripes[i - 8U];
+  return meta.overflow_threads[i - 8U];
 }
 
-bool try_register_stripe_cell_locked(std::uint32_t slot,
-                                     PerStripeSlotMeta& meta,
-                                     std::uint16_t stripe,
+// Called ONLY by thread `tid` itself under `lock_cb(cb)`.
+bool try_register_thread_cell_locked(std::uint32_t slot,
+                                     PerThreadSlotMeta& meta, std::uint16_t tid,
                                      std::int64_t init_encoded) noexcept {
   std::int64_t* const cell =
       g_portable_slab_base +
-      (static_cast<std::size_t>(stripe) << kPortableSlotShift) + slot;
+      (static_cast<std::size_t>(tid) << kPortableSlotShift) + slot;
   if (__atomic_load_n(cell, __ATOMIC_RELAXED) != 0) {
     return false;
   }
-  append_reg_stripe_locked(meta, stripe);
+  append_reg_thread_locked(meta, tid);
   __atomic_store_n(cell, init_encoded, __ATOMIC_RELEASE);
   return true;
 }
 
-void wait_for_hazard_quiescence(const PortableSpCountedBase* old_cb,
-                                const PerStripeSlotMeta& meta) noexcept {
+std::int64_t harvest_and_close_thread_cell(std::uint16_t tid,
+                                           std::uint32_t slot) noexcept {
+  PortableThreadGate& gate = g_thread_gates[tid];
+  while (gate.harvester_lock.exchange(1U, std::memory_order_acquire) != 0U) {
+    while (gate.harvester_lock.load(std::memory_order_relaxed) != 0U) {
+      ::theta::arch::cpu_relax();
+    }
+  }
+  gate.harvester_busy.store(1U, std::memory_order_seq_cst);
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  const std::uint32_t n = g_hazard_high_water.load(std::memory_order_acquire);
+  std::uint32_t spins = 0U;
+  while (gate.owner_busy.load(std::memory_order_seq_cst) != 0U) {
+    if ((++spins & 63U) == 0U) {
+      std::this_thread::yield();
+    } else {
+      ::theta::arch::cpu_relax();
+    }
+  }
+
+  std::int64_t* const cell =
+      g_portable_slab_base +
+      (static_cast<std::size_t>(tid) << kPortableSlotShift) + slot;
+  const std::int64_t v = __atomic_exchange_n(cell, 0, __ATOMIC_ACQUIRE);
+
+  gate.harvester_busy.store(0U, std::memory_order_release);
+  gate.harvester_lock.store(0U, std::memory_order_release);
+  return v;
+}
+
+void wait_for_hazard_quiescence(const PortableSpCountedBase* old_cb,
+                                const PerThreadSlotMeta& meta) noexcept {
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  const std::uint32_t n = g_gate_high_water.load(std::memory_order_acquire);
+  const void* const target = static_cast<const void*>(old_cb);
   for (std::uint32_t i = 0U; i < n; ++i) {
+    PortableThreadGate& gate = g_thread_gates[i];
     std::uint32_t spins = 0U;
-    while (g_hazard_records[i].protected_cb.load(std::memory_order_seq_cst) ==
-           static_cast<const void*>(old_cb)) {
+    while (gate.owner_busy.load(std::memory_order_seq_cst) != 0U) {
+      if (meta.pin_count.load(std::memory_order_acquire) > 0U) {
+        return;
+      }
+      if ((++spins & 63U) == 0U) {
+        std::this_thread::yield();
+      } else {
+        ::theta::arch::cpu_relax();
+      }
+    }
+    spins = 0U;
+    while (gate.cold_hazard_cb.load(std::memory_order_seq_cst) == target) {
       if (meta.pin_count.load(std::memory_order_acquire) > 0U) {
         return;
       }
@@ -457,7 +492,8 @@ void retire_unpromoted_locked(PortableSpCountedBase* cb,
 bool promote_to_striped_locked(PortableSpCountedBase* cb,
                                std::int64_t initial_tickets,
                                std::int64_t first_delta) noexcept {
-  const std::uint16_t stripe = ensure_thread_tls_initialized();
+  std::uint16_t tid = 0U;
+  const bool has_tid = ensure_thread_tls_initialized(tid);
   if (!g_portable_slab_ok) {
     return false;
   }
@@ -468,18 +504,19 @@ bool promote_to_striped_locked(PortableSpCountedBase* cb,
 
   cb->_M_weak_add_ref();
 
-  PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+  PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
   meta.central_tickets.store(initial_tickets, std::memory_order_relaxed);
   meta.last_harvest_ms = 0ULL;
   meta.rapid_harvest_streak = 0U;
-  meta.num_reg_stripes = 0U;
+  meta.num_reg_threads = 0U;
   meta.pin_count.store(0U, std::memory_order_relaxed);
   meta.atomic_pin_reads.store(0U, std::memory_order_relaxed);
   meta.quiescing_unpins = 0U;
   meta.keepalive_ptr_set = 0U;
   __atomic_store_n(&cb->fast_.slot_id, slot, __ATOMIC_RELEASE);
 
-  if (!try_register_stripe_cell_locked(slot, meta, stripe, 1 + first_delta) &&
+  if ((!has_tid ||
+       !try_register_thread_cell_locked(slot, meta, tid, 1 + first_delta)) &&
       first_delta != 0) [[unlikely]] {
     meta.central_tickets.fetch_add(first_delta, std::memory_order_relaxed);
   }
@@ -597,18 +634,18 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   }
 
   if (mode == kModePerCpuActive) {
-    const std::uint16_t stripe = ensure_thread_tls_initialized();
+    std::uint16_t tid = 0U;
+    const bool has_tid = ensure_thread_tls_initialized(tid);
     const std::uint32_t slot = cb->fast_.slot_id;
-    PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+    PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
     std::int64_t drained = 0;
-    if (PortableBackend::try_drain_local_surplus(&cb->fast_, drained)) {
+    if (PortableBackend::try_drain_local_surplus_locked(&cb->fast_, drained)) {
       meta.central_tickets.fetch_add(drained + 1, std::memory_order_release);
       unlock_cb(cb);
       return;
     }
-    if (!g_tls_cache.stripe_assigned ||
-        !try_register_stripe_cell_locked(slot, meta, stripe,
-                                         /*init_encoded=*/2)) {
+    if (!has_tid ||
+        !try_register_thread_cell_locked(slot, meta, tid, /*init_encoded=*/2)) {
       meta.central_tickets.fetch_add(1, std::memory_order_relaxed);
     }
     unlock_cb(cb);
@@ -682,7 +719,7 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   }
 
   const std::uint32_t slot = cb->fast_.slot_id;
-  PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+  PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
 
   const std::int64_t rem =
       meta.central_tickets.fetch_sub(1, std::memory_order_acq_rel) - 1;
@@ -691,20 +728,14 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     return;
   }
 
-  // Atomically close and drain every registered stripe via `exchange(cell, 0)`.
-  // Any concurrent `CAS(cell, cur >= 1, ...)` either ordered before this
-  // `exchange` (included in `v`) or sees `0` and falls back to `lock_cb(cb)`.
   __atomic_store_n(&cb->fast_.fast_active, 0U, __ATOMIC_RELEASE);
 
-  const std::uint32_t n_stripes = meta.num_reg_stripes;
+  const std::uint32_t n_threads = meta.num_reg_threads;
   std::int64_t delta_sum = 0;
 #pragma clang loop vectorize(disable) unroll(disable)
-  for (std::uint32_t i = 0U; i < n_stripes; ++i) {
-    const std::uint16_t s = get_reg_stripe_locked(meta, i);
-    std::int64_t* const cell =
-        g_portable_slab_base +
-        (static_cast<std::size_t>(s) << kPortableSlotShift) + slot;
-    const std::int64_t v = __atomic_exchange_n(cell, 0, __ATOMIC_ACQUIRE);
+  for (std::uint32_t i = 0U; i < n_threads; ++i) {
+    const std::uint16_t t = get_reg_thread_locked(meta, i);
+    const std::int64_t v = harvest_and_close_thread_cell(t, slot);
     if (v >= 1) {
       delta_sum += (v - 1);
     }
@@ -720,7 +751,7 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   meta.last_harvest_ms = (now_ms != 0ULL) ? now_ms : 1ULL;
 
   if (h_after == 0) {
-    meta.num_reg_stripes = 0U;
+    meta.num_reg_threads = 0U;
     meta.central_tickets.store(0, std::memory_order_relaxed);
     if (__atomic_load_n(&cb->fast_.has_weak_or_std, __ATOMIC_ACQUIRE) == 0U) {
       __atomic_store_n(&cb->fast_.slot_id, kWarmupSealedBit, __ATOMIC_RELAXED);
@@ -740,11 +771,11 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   if (meta.pin_count.load(std::memory_order_relaxed) > 0U ||
       meta.quiescing_unpins > 0U || meta.rapid_harvest_streak <= 64U) {
 #pragma clang loop vectorize(disable) unroll(disable)
-    for (std::uint32_t i = 0U; i < n_stripes; ++i) {
-      const std::uint16_t s = get_reg_stripe_locked(meta, i);
+    for (std::uint32_t i = 0U; i < n_threads; ++i) {
+      const std::uint16_t t = get_reg_thread_locked(meta, i);
       std::int64_t* const cell =
           g_portable_slab_base +
-          (static_cast<std::size_t>(s) << kPortableSlotShift) + slot;
+          (static_cast<std::size_t>(t) << kPortableSlotShift) + slot;
       __atomic_store_n(cell, 1, __ATOMIC_RELEASE);
     }
     meta.central_tickets.store(h_after, std::memory_order_relaxed);
@@ -753,7 +784,7 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     return;
   }
 
-  meta.num_reg_stripes = 0U;
+  meta.num_reg_threads = 0U;
   meta.central_tickets.store(0, std::memory_order_relaxed);
   for (std::int64_t i = 0; i < h_after - 1; ++i) {
     cb->_M_add_ref_copy();
@@ -793,7 +824,7 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
     return cnt;
   }
   const std::uint32_t slot = cb->fast_.slot_id;
-  const PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+  const PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
   const long legacy_plus_lease = pi->_M_get_use_count();
   const long legacy_refs =
       legacy_plus_lease > 0L ? (legacy_plus_lease - 1L) : 0L;
@@ -803,13 +834,13 @@ AtomicPtrShard& shard_for_addr(const void* addr) noexcept {
   std::int64_t total = legacy_refs +
                        meta.central_tickets.load(std::memory_order_relaxed) -
                        active_cushions * kPinnedTicketCushion;
-  const std::uint32_t n_stripes = meta.num_reg_stripes;
+  const std::uint32_t n_threads = meta.num_reg_threads;
 #pragma clang loop vectorize(disable) unroll(disable)
-  for (std::uint32_t i = 0U; i < n_stripes; ++i) {
-    const std::uint16_t s = get_reg_stripe_locked(meta, i);
+  for (std::uint32_t i = 0U; i < n_threads; ++i) {
+    const std::uint16_t t = get_reg_thread_locked(meta, i);
     const std::int64_t* const cell =
         g_portable_slab_base +
-        (static_cast<std::size_t>(s) << kPortableSlotShift) + slot;
+        (static_cast<std::size_t>(t) << kPortableSlotShift) + slot;
     const std::int64_t v = __atomic_load_n(cell, __ATOMIC_RELAXED);
     if (v >= 1) {
       total += (v - 1);
@@ -943,7 +974,8 @@ sp_keepalive_unpinned_sentinel() noexcept {
 
 [[gnu::aligned(64)]] SpPinResult sp_pin_for_keepalive(
     PortableSpCountedBase* cb, void* managed_ptr) noexcept {
-  const std::uint16_t stripe = ensure_thread_tls_initialized();
+  std::uint16_t tid = 0U;
+  const bool has_tid = ensure_thread_tls_initialized(tid);
   if (!g_portable_slab_ok) [[unlikely]] {
     return SpPinResult::kThrottledStorm;
   }
@@ -958,10 +990,10 @@ sp_keepalive_unpinned_sentinel() noexcept {
       return SpPinResult::kThrottledStorm;
     }
   } else if (cb->fast_.mode == kModePerCpuActive) {
-    if (g_tls_cache.stripe_assigned) {
+    if (has_tid) {
       const std::uint32_t slot = cb->fast_.slot_id;
-      (void)try_register_stripe_cell_locked(slot, g_portable_slot_meta[slot],
-                                            stripe, /*init_encoded=*/1);
+      (void)try_register_thread_cell_locked(slot, g_portable_slot_meta[slot],
+                                            tid, /*init_encoded=*/1);
     }
   } else {
     unlock_cb(cb);
@@ -969,7 +1001,7 @@ sp_keepalive_unpinned_sentinel() noexcept {
   }
 
   const std::uint32_t slot = cb->fast_.slot_id;
-  PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+  PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
   void* existing =
       __atomic_load_n(&g_portable_keepalive_ptrs[slot], __ATOMIC_RELAXED);
   if (meta.keepalive_ptr_set != 0U && existing != managed_ptr) [[unlikely]] {
@@ -997,7 +1029,8 @@ sp_keepalive_unpinned_sentinel() noexcept {
   if (managed_ptr == nullptr) [[unlikely]] {
     return false;
   }
-  const std::uint16_t stripe = ensure_thread_tls_initialized();
+  std::uint16_t tid = 0U;
+  const bool has_tid = ensure_thread_tls_initialized(tid);
   if (!g_portable_slab_ok) [[unlikely]] {
     return false;
   }
@@ -1021,7 +1054,7 @@ sp_keepalive_unpinned_sentinel() noexcept {
     out_never_pin = (cb->fast_.mode == kModeAtomicRetired);
     return false;
   }
-  PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+  PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
   void* existing =
       __atomic_load_n(&g_portable_keepalive_ptrs[slot], __ATOMIC_RELAXED);
   if (meta.keepalive_ptr_set != 0U && existing != managed_ptr) [[unlikely]] {
@@ -1039,29 +1072,34 @@ sp_keepalive_unpinned_sentinel() noexcept {
                                    std::memory_order_relaxed);
   }
   meta.pin_count.store(prev_pins + 1U, std::memory_order_release);
-  if (g_tls_cache.stripe_assigned) {
-    (void)try_register_stripe_cell_locked(slot, meta, stripe,
-                                          /*init_encoded=*/1);
+  if (has_tid) {
+    (void)try_register_thread_cell_locked(slot, meta, tid, /*init_encoded=*/1);
   }
   unlock_cb(cb);
   return true;
 }
 
 [[gnu::aligned(64)]] void* sp_acquire_pinned_under_hazard_slow(
-    PortableSpCountedBase* cb, std::atomic<const void*>* hazard_ptr) noexcept {
-  const std::uint16_t stripe = ensure_thread_tls_initialized();
+    PortableSpCountedBase* cb, PortableThreadGate* gate) noexcept {
+  // Hand off hazard protection to `cold_hazard_cb` BEFORE releasing
+  // `owner_busy` so `owner_busy` never blocks across `lock_cb(cb)`.
+  gate->cold_hazard_cb.store(cb, std::memory_order_seq_cst);
+  PortableBackend::exit_owner_gate(gate);
+
+  std::uint16_t tid = 0U;
+  const bool has_tid = ensure_thread_tls_initialized(tid);
   lock_cb(cb);
   void* managed = nullptr;
   if (cb->fast_.mode == kModePerCpuActive) [[likely]] {
     const std::uint32_t slot = cb->fast_.slot_id;
     managed =
         __atomic_load_n(&g_portable_keepalive_ptrs[slot], __ATOMIC_RELAXED);
-    PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+    PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
     std::int64_t drained = 0;
-    if (PortableBackend::try_drain_local_surplus(&cb->fast_, drained)) {
+    if (PortableBackend::try_drain_local_surplus_locked(&cb->fast_, drained)) {
       meta.central_tickets.fetch_add(drained + 1, std::memory_order_release);
-    } else if (!g_tls_cache.stripe_assigned ||
-               !try_register_stripe_cell_locked(slot, meta, stripe,
+    } else if (!has_tid ||
+               !try_register_thread_cell_locked(slot, meta, tid,
                                                 /*init_encoded=*/2)) {
       meta.central_tickets.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1074,22 +1112,22 @@ sp_keepalive_unpinned_sentinel() noexcept {
     cb->_M_add_ref_copy();
   }
   unlock_cb(cb);
-  hazard_ptr->store(nullptr, std::memory_order_release);
+  gate->cold_hazard_cb.store(nullptr, std::memory_order_release);
   return managed;
 }
 
 [[gnu::aligned(64)]] void sp_register_keepalive_stripe_slow(
     PortableSpCountedBase* cb) noexcept {
-  const std::uint16_t stripe = ensure_thread_tls_initialized();
-  if (!g_tls_cache.stripe_assigned ||
+  std::uint16_t tid = 0U;
+  if (!ensure_thread_tls_initialized(tid) ||
       __atomic_load_n(&cb->fast_.mode, __ATOMIC_ACQUIRE) != kModePerCpuActive) {
     return;
   }
   lock_cb(cb);
   if (cb->fast_.mode == kModePerCpuActive) {
     const std::uint32_t slot = cb->fast_.slot_id;
-    (void)try_register_stripe_cell_locked(slot, g_portable_slot_meta[slot],
-                                          stripe, /*init_encoded=*/1);
+    (void)try_register_thread_cell_locked(slot, g_portable_slot_meta[slot], tid,
+                                          /*init_encoded=*/1);
   }
   unlock_cb(cb);
 }
@@ -1107,7 +1145,7 @@ sp_keepalive_unpinned_sentinel() noexcept {
   }
 
   const std::uint32_t slot = old_cb->fast_.slot_id;
-  PerStripeSlotMeta& meta = g_portable_slot_meta[slot];
+  PerThreadSlotMeta& meta = g_portable_slot_meta[slot];
 
   const std::uint32_t prev_pins =
       meta.pin_count.load(std::memory_order_relaxed);
@@ -1146,24 +1184,23 @@ sp_keepalive_unpinned_sentinel() noexcept {
 
   __atomic_store_n(&old_cb->fast_.fast_active, 0U, __ATOMIC_RELEASE);
 
-  const std::uint32_t n_stripes = meta.num_reg_stripes;
+  const bool stay_pinned =
+      meta.pin_count.load(std::memory_order_relaxed) > 0U ||
+      meta.quiescing_unpins > 0U;
+  const std::uint32_t n_threads = meta.num_reg_threads;
   std::int64_t delta_sum = 0;
 #pragma clang loop vectorize(disable) unroll(disable)
-  for (std::uint32_t i = 0U; i < n_stripes; ++i) {
-    const std::uint16_t s = get_reg_stripe_locked(meta, i);
-    std::int64_t* const cell =
-        g_portable_slab_base +
-        (static_cast<std::size_t>(s) << kPortableSlotShift) + slot;
-    const std::int64_t v = __atomic_exchange_n(cell, 0, __ATOMIC_ACQUIRE);
+  for (std::uint32_t i = 0U; i < n_threads; ++i) {
+    const std::uint16_t t = get_reg_thread_locked(meta, i);
+    const std::int64_t v = harvest_and_close_thread_cell(t, slot);
     if (v >= 1) {
       delta_sum += (v - 1);
     }
   }
 
   const std::int64_t h_after = rem + delta_sum;
-  if (h_after <= 0 || (meta.pin_count.load(std::memory_order_relaxed) == 0U &&
-                       meta.quiescing_unpins == 0U)) {
-    meta.num_reg_stripes = 0U;
+  if (!stay_pinned) {
+    meta.num_reg_threads = 0U;
     meta.central_tickets.store(0, std::memory_order_relaxed);
     for (std::int64_t i = 0; i < h_after - 1; ++i) {
       old_cb->_M_add_ref_copy();
@@ -1188,11 +1225,11 @@ sp_keepalive_unpinned_sentinel() noexcept {
   }
 
 #pragma clang loop vectorize(disable) unroll(disable)
-  for (std::uint32_t i = 0U; i < n_stripes; ++i) {
-    const std::uint16_t s = get_reg_stripe_locked(meta, i);
+  for (std::uint32_t i = 0U; i < n_threads; ++i) {
+    const std::uint16_t t = get_reg_thread_locked(meta, i);
     std::int64_t* const cell =
         g_portable_slab_base +
-        (static_cast<std::size_t>(s) << kPortableSlotShift) + slot;
+        (static_cast<std::size_t>(t) << kPortableSlotShift) + slot;
     __atomic_store_n(cell, 1, __ATOMIC_RELEASE);
   }
   meta.central_tickets.store(h_after, std::memory_order_relaxed);

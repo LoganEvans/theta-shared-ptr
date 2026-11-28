@@ -4,19 +4,21 @@
 //
 // `theta::portable::SharedPtr<T>` / `AtomicSharedPtr<T>` / `KeepAlive<T>`
 // ----------------------------------------------------------------------------
-// Pure standard C++23 concurrent smart pointer & atomic snapshot suite with
-// zero Linux `rseq`, zero inline assembly, and zero `SYS_membarrier` IPIs:
+// Portable concurrent smart pointer & atomic snapshot suite with zero Linux
+// `rseq`, zero `<pthread.h>`, and zero `SYS_membarrier` IPIs:
 //   1. `SharedPtr<T>` (`16 B`, `std::shared_ptr<T>` ABI-compatible):
 //      - `0` copies: zero-atomic, zero-vcall sole-owner destroy (`hdr64 == 0`).
 //      - `1..63` copies: lock-free inline `slot_id` warmup CAS (`0 B` slab).
-//      - `>= 64` copies: 128-stripe thread-hashed L1d-private atomic slab,
-//        harvested via `atomic_exchange(cell, 0, acquire)` (`0` OS syscalls).
+//      - `>= 64` copies: dedicated per-thread L1d-private slab (`CAS` on
+//        `copy`/dtor, harvested via Dekker gate + `atomic_exchange(cell, 0)`).
 //   2. `AtomicSharedPtr<T>` (`16 B`, `std::atomic<SharedPtr<T>>`) &
 //      `KeepAlive<T>`:
-//      - Reader `.load()` / `.get()` publishes `cb` into a 64B-isolated
-//        per-thread hazard slot (`seq_cst` Dekker handshake), increments the
-//        thread-local L1d slab cell, and clears the hazard slot with zero
-//        shared cache-line writes.
+//      - Reader `.load()` / `.get()` enters a 64B-isolated per-thread 2-party
+//        Dekker byte gate (`[harvester_busy, owner_busy]`: red-zone
+//        `lock orl $0, -8(%rsp)` on x86-64; disjoint-byte `STLRB -> LDARB`
+//        `RCsc` with zero `dmb ish` on ARM64), validates the pointer, bumps
+//        the single-owner L1d slab cell with a plain non-RMW store, and exits
+//        the gate (`0` shared cache-line writes, `0` `CAS` on `.load()`).
 
 #pragma once
 
@@ -2120,40 +2122,40 @@ class KeepAlive {
   void store(SharedPtr<T> desired) { (void)reset(std::move(desired)); }
 
   [[nodiscard]] THETA_FORCE_INLINE SharedPtr<T> get() const noexcept {
-    auto* const cb = __atomic_load_n(&active_cb_, __ATOMIC_ACQUIRE);
-    if (cb == nullptr) {
+    auto* const cb_peek = __atomic_load_n(&active_cb_, __ATOMIC_RELAXED);
+    if (cb_peek == nullptr) [[unlikely]] {
+      (void)__atomic_load_n(&active_cb_, __ATOMIC_ACQUIRE);
       return SharedPtr<T>{};
     }
-    if (cb == detail::shared_ptr::sp_keepalive_unpinned_sentinel())
+    if (cb_peek == detail::shared_ptr::sp_keepalive_unpinned_sentinel())
         [[unlikely]] {
       return get_slow();
     }
     const auto tls = detail::shared_ptr::g_portable_fast_tls;
-    if (tls.hazard_ptr == nullptr) [[unlikely]] {
+    if (tls.gate == nullptr) [[unlikely]] {
       return get_slow();
     }
-    tls.hazard_ptr->store(cb, std::memory_order_seq_cst);
-    if (__atomic_load_n(&active_cb_, __ATOMIC_SEQ_CST) != cb) [[unlikely]] {
-      tls.hazard_ptr->store(nullptr, std::memory_order_release);
+    const bool gate_ok =
+        detail::shared_ptr::PortableBackend::enter_owner_gate(tls.gate);
+    auto* const cb = __atomic_load_n(&active_cb_, __ATOMIC_SEQ_CST);
+    if (!gate_ok || cb != cb_peek) [[unlikely]] {
+      detail::shared_ptr::PortableBackend::exit_owner_gate(tls.gate);
       return get_slow();
     }
     const std::uint32_t slot =
         __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
     std::int64_t* const cell = tls.stripe_base + slot;
-    std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);
-    if (cur >= 1 && cur < 65 &&
-        __atomic_compare_exchange_n(cell, &cur, cur + 1, false,
-                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-        [[likely]] {
+    const std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);
+    if (cur >= 1 && cur < 65) [[likely]] {
+      __atomic_store_n(cell, cur + 1, __ATOMIC_RELAXED);
       auto* const managed = static_cast<element_type*>(
           __atomic_load_n(&detail::shared_ptr::g_portable_keepalive_ptrs[slot],
                           __ATOMIC_RELAXED));
-      tls.hazard_ptr->store(nullptr, std::memory_order_release);
+      detail::shared_ptr::PortableBackend::exit_owner_gate(tls.gate);
       return SharedPtr<T>(managed, cb, detail::shared_ptr::AdoptRefTag{});
     }
     auto* const managed = static_cast<element_type*>(
-        detail::shared_ptr::sp_acquire_pinned_under_hazard_slow(
-            cb, tls.hazard_ptr));
+        detail::shared_ptr::sp_acquire_pinned_under_hazard_slow(cb, tls.gate));
     return SharedPtr<T>(managed, cb, detail::shared_ptr::AdoptRefTag{});
   }
 
@@ -2289,43 +2291,46 @@ struct atomic<::theta::portable::SharedPtr<T>> {
   [[nodiscard]] THETA_FORCE_INLINE value_type
   load(std::memory_order order = std::memory_order_seq_cst) const noexcept {
     (void)order;
-    const std::uintptr_t rep = __atomic_load_n(&rep_, __ATOMIC_ACQUIRE);
-    if (rep == 0ULL) {
+    const std::uintptr_t rep_peek = __atomic_load_n(&rep_, __ATOMIC_RELAXED);
+    if (rep_peek == 0ULL) [[unlikely]] {
+      (void)__atomic_load_n(&rep_, __ATOMIC_ACQUIRE);
       return value_type{};
     }
-    if ((rep & kRepUnpinnedBit) != 0ULL) [[unlikely]] {
+    if ((rep_peek & kRepUnpinnedBit) != 0ULL) [[unlikely]] {
       return load_slow();
     }
     const auto tls = ::theta::portable::detail::shared_ptr::g_portable_fast_tls;
-    if (tls.hazard_ptr == nullptr) [[unlikely]] {
+    if (tls.gate == nullptr) [[unlikely]] {
+      return load_slow();
+    }
+    const bool gate_ok = ::theta::portable::detail::shared_ptr::
+        PortableBackend::enter_owner_gate(tls.gate);
+    const std::uintptr_t rep = __atomic_load_n(&rep_, __ATOMIC_SEQ_CST);
+    if (!gate_ok || rep != rep_peek) [[unlikely]] {
+      ::theta::portable::detail::shared_ptr::PortableBackend::exit_owner_gate(
+          tls.gate);
       return load_slow();
     }
     auto* const cb = reinterpret_cast<
         ::theta::portable::detail::shared_ptr::PortableSpCountedBase*>(rep);
-    tls.hazard_ptr->store(cb, std::memory_order_seq_cst);
-    if (__atomic_load_n(&rep_, __ATOMIC_SEQ_CST) != rep) [[unlikely]] {
-      tls.hazard_ptr->store(nullptr, std::memory_order_release);
-      return load_slow();
-    }
     const std::uint32_t slot =
         __atomic_load_n(&cb->fast_.slot_id, __ATOMIC_RELAXED);
     std::int64_t* const cell = tls.stripe_base + slot;
-    std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);
-    if (cur >= 1 && cur < 65 &&
-        __atomic_compare_exchange_n(cell, &cur, cur + 1, false,
-                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-        [[likely]] {
+    const std::int64_t cur = __atomic_load_n(cell, __ATOMIC_RELAXED);
+    if (cur >= 1 && cur < 65) [[likely]] {
+      __atomic_store_n(cell, cur + 1, __ATOMIC_RELAXED);
       auto* const managed = static_cast<element_type*>(
           __atomic_load_n(&::theta::portable::detail::shared_ptr::
                               g_portable_keepalive_ptrs[slot],
                           __ATOMIC_RELAXED));
-      tls.hazard_ptr->store(nullptr, std::memory_order_release);
+      ::theta::portable::detail::shared_ptr::PortableBackend::exit_owner_gate(
+          tls.gate);
       return ::theta::portable::detail::shared_ptr::SpAtomicAccess::
           make_adopted<T>(managed, cb);
     }
     auto* const managed = static_cast<element_type*>(
         ::theta::portable::detail::shared_ptr::
-            sp_acquire_pinned_under_hazard_slow(cb, tls.hazard_ptr));
+            sp_acquire_pinned_under_hazard_slow(cb, tls.gate));
     return ::theta::portable::detail::shared_ptr::SpAtomicAccess::make_adopted<
         T>(managed, cb);
   }

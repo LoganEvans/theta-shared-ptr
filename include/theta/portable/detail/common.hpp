@@ -18,7 +18,7 @@
 
 namespace theta::portable {
 
-inline constexpr std::uint32_t kPortableNumStripes = 128U;
+inline constexpr std::uint32_t kMaxPortableThreads = 512U;
 
 namespace detail::shared_ptr {
 
@@ -86,11 +86,25 @@ extern const void* const kPortableSpVtableSym[] asm(
     "_ZTVN5theta8portable6detail10shared_ptr21PortableSpCountedBaseE");
 #endif
 
-// Zero-guard 16-byte POD TLS fast-path state:
-//   - `hazard_ptr`: points directly to this thread's 64B-isolated hazard slot
-//   - `stripe_base`: precomputed `g_portable_slab_base + (stripe << shift)`
+// ============================================================================
+// 64B Cache-Line-Isolated Per-Thread 2-Party Dekker Gate + Cold Hazard Slot
+//   - Byte 0 (`harvester_busy`): written ONLY by Harvester (`0` = open)
+//   - Byte 1 (`owner_busy`):     written ONLY by Owner thread (non-zero offset;
+//     acts as both the slab Dekker byte AND the fast-path reader epoch gate!)
+//   - `cold_hazard_cb`:          populated ONLY when `.load()`/`.get()` misses
+//     the 5-instruction fast cell and drops `owner_busy` before `lock_cb(cb)`.
+// ============================================================================
+struct alignas(64) PortableThreadGate {
+  std::atomic<std::uint8_t> harvester_busy{0};
+  std::atomic<std::uint8_t> owner_busy{0};
+  std::atomic<std::uint8_t> harvester_lock{0};
+  std::atomic<bool> in_use{false};
+  std::uint32_t pad0_{0};
+  std::atomic<const void*> cold_hazard_cb{nullptr};
+};
+
 struct alignas(16) PortableFastTls {
-  std::atomic<const void*>* hazard_ptr;
+  PortableThreadGate* gate;
   std::int64_t* stripe_base;
 };
 
@@ -120,7 +134,7 @@ void sp_adopt_from_std_move(StdSpCountedBase* pi) noexcept;
                                           void* managed_ptr,
                                           bool& out_never_pin) noexcept;
 [[nodiscard]] void* sp_acquire_pinned_under_hazard_slow(
-    PortableSpCountedBase* cb, std::atomic<const void*>* hazard_ptr) noexcept;
+    PortableSpCountedBase* cb, PortableThreadGate* gate) noexcept;
 void sp_register_keepalive_stripe_slow(PortableSpCountedBase* cb) noexcept;
 void sp_unpin_and_retire_old(PortableSpCountedBase* old_cb,
                              bool drop_anchor_ref,
@@ -146,13 +160,39 @@ THETA_FORCE_INLINE bool is_portable_sp(const StdSpCountedBase* pi) noexcept {
 }
 
 // ============================================================================
-// Pure C++23 Portable Backend:
-//   - Thread-hashed L1d-private striped atomic slab (`CAS` against `cell >= 1`,
-//     linearized without OS IPIs via harvester `atomic_exchange(cell, 0)`).
-//   - Cache-line-isolated thread hazard slot (`seq_cst` Dekker handshake) for
-//     `16 B` `AtomicSharedPtr<T>::load()` and `KeepAlive<T>::get()`.
+// 2-Party Dekker Gate + Fused Hazard-Slot Backend:
+//   - On x86-64: `movb $1, 1(%gate)` + stack red-zone `lock orl $0, -8(%rsp)` +
+//     disjoint `cmpb $0, (%gate)` (`0` partial-STLF penalty, `0` `xchgb`).
+//   - On AArch64 / C++23: `stlrb` (`owner_busy`) -> `ldarb` (`harvester_busy`)
+//     disjoint-byte `RCsc` handshake (`0` `dmb ish`, `0` `cas`/`casl`).
+//   - Inside the gate, `slab[tid][slot]` is 100% single-owner non-atomic memory
+//     and unlock is a single 1-byte store `owner_busy = 0`.
 // ============================================================================
 struct PortableBackend {
+  static THETA_FORCE_INLINE bool enter_owner_gate(
+      PortableThreadGate* gate) noexcept {
+#if THETA_ARCH_X86_64 && !THETA_TSAN_ENABLED
+    gate->owner_busy.store(1U, std::memory_order_relaxed);
+    if constexpr (::theta::arch::kHasRedZoneStlfPause) {
+      // WHY ASM: (b) Missing ISA/C++ construct — drains the x86 Store Buffer
+      // and AMD Zen 5 Write-Coalescing Buffer on the private M-state stack
+      // red-zone line (~4.8 ns vs `mfence` ~14 ns or `xchgb` ~8.3 ns).
+      asm volatile("lock orl $0, -8(%%rsp)" ::: "memory", "cc");
+    } else {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    return gate->harvester_busy.load(std::memory_order_relaxed) == 0U;
+#else
+    gate->owner_busy.store(1U, std::memory_order_seq_cst);
+    return gate->harvester_busy.load(std::memory_order_seq_cst) == 0U;
+#endif
+  }
+
+  static THETA_FORCE_INLINE void exit_owner_gate(
+      PortableThreadGate* gate) noexcept {
+    gate->owner_busy.store(0U, std::memory_order_release);
+  }
+
   static THETA_FORCE_INLINE bool try_stripe_inc_slot(
       std::uint32_t slot) noexcept {
     std::int64_t* const base = g_portable_fast_tls.stripe_base;
@@ -189,7 +229,7 @@ struct PortableBackend {
     return false;
   }
 
-  static THETA_FORCE_INLINE bool try_drain_local_surplus(
+  static THETA_FORCE_INLINE bool try_drain_local_surplus_locked(
       SpFastHeader* fast, std::int64_t& out_drained) noexcept {
     if (__atomic_load_n(&fast->fast_active, __ATOMIC_ACQUIRE) == 0U) {
       return false;
