@@ -13,6 +13,7 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <theta/portable/shared_ptr.hpp>
 #include <theta/shared_ptr.hpp>
 #include <thread>
 #include <unordered_set>
@@ -1331,6 +1332,121 @@ TEST(SharedPtrTest, ConcurrentUnpromotedRetireVsReleaseAcquireOrdering) {
   items.reset();
   EXPECT_EQ(TrackedBase::live.load(), 0);
   EXPECT_EQ(TrackedBase::dtors.load(), kRounds);
+}
+
+TEST(SharedPtrTest, PortableStripedSlabAndHazardAtomicStress) {
+  TrackedBase::reset_counts();
+
+  // 1. Sole-owner + warmup + >=64-copy striped promotion + `std::shared_ptr`
+  // ABI interop:
+  {
+    auto p0 = portable::make_shared<TrackedBase>(42);
+    EXPECT_EQ(p0.use_count(), 1);
+    std::vector<portable::SharedPtr<TrackedBase>> copies;
+    copies.reserve(96);
+    for (int i = 0; i < 96; ++i) {
+      copies.push_back(p0);
+    }
+    EXPECT_EQ(p0.use_count(), 97);
+
+    portable::WeakPtr<TrackedBase> wp(p0);
+    EXPECT_FALSE(wp.expired());
+    auto locked = wp.lock();
+    ASSERT_NE(locked.get(), nullptr);
+    EXPECT_EQ(locked->base_val, 42);
+    locked.reset();
+
+#if THETA_SHARED_PTR_HAS_GLIBCXX_ABI
+    std::shared_ptr<TrackedBase> std_sp = p0.to_std();
+    EXPECT_EQ(std_sp->base_val, 42);
+    EXPECT_EQ(p0.use_count(), 98);
+    portable::SharedPtr<TrackedBase> roundtrip(std::move(std_sp));
+    EXPECT_EQ(roundtrip->base_val, 42);
+    roundtrip.reset();
+#endif
+
+    copies.clear();
+    p0.reset();
+    EXPECT_TRUE(wp.expired());
+  }
+  EXPECT_EQ(TrackedBase::live.load(), 0);
+
+  // 2. Concurrent `portable::AtomicSharedPtr` + `portable::KeepAlive` hazard
+  // slot vs rapid writer retirement + cross-thread striped copy/destroy:
+  TrackedBase::reset_counts();
+  portable::AtomicSharedPtr<TrackedBase> atomic_cell(
+      portable::make_shared<TrackedBase>(1));
+  portable::KeepAlive<TrackedBase> keepalive_cell(
+      portable::make_shared<TrackedBase>(2));
+  auto hot_shared = portable::make_shared<TrackedBase>(999);
+  std::vector<portable::SharedPtr<TrackedBase>> seed_promotion(70, hot_shared);
+  seed_promotion.clear();
+
+  constexpr int kReaders = 4;
+  constexpr int kWriters = 2;
+  constexpr int kIters = arch::kTsanEnabled ? 1500 : 12000;
+
+  std::atomic<bool> done{false};
+  std::vector<std::thread> threads;
+
+  for (int w = 0; w < kWriters; ++w) {
+    threads.emplace_back([&, w]() {
+      for (int i = 0; i < kIters; ++i) {
+        const int v = (w + 1) * 100000 + i;
+        auto fresh = portable::make_shared<TrackedBase>(v);
+        // Pre-promote half the snapshots so pinned hazard fast path is hit
+        // immediately on `.store()` / `.reset()` as well as via `load_slow`
+        // auto-pinning!
+        if ((i & 1) == 0) {
+          std::vector<portable::SharedPtr<TrackedBase>> warm(66, fresh);
+          warm.clear();
+        }
+        if ((i & 3) == 0) {
+          auto cur = atomic_cell.load(std::memory_order_acquire);
+          (void)atomic_cell.compare_exchange_weak(cur, std::move(fresh),
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire);
+        } else {
+          atomic_cell.store(std::move(fresh), std::memory_order_release);
+        }
+        if (w == 0 && (i & 7) == 0) {
+          (void)keepalive_cell.reset(portable::make_shared<TrackedBase>(v + 1));
+        }
+      }
+    });
+  }
+
+  for (int r = 0; r < kReaders; ++r) {
+    threads.emplace_back([&]() {
+      std::uint64_t sum = 0;
+      while (!done.load(std::memory_order_acquire)) {
+        auto s1 = atomic_cell.load(std::memory_order_acquire);
+        if (s1) {
+          sum += static_cast<std::uint64_t>(s1->base_val);
+        }
+        auto s2 = keepalive_cell.get();
+        if (s2) {
+          sum += static_cast<std::uint64_t>(s2->base_val);
+        }
+        auto s3 = hot_shared;
+        sum += static_cast<std::uint64_t>(s3->base_val);
+      }
+      EXPECT_GT(sum, 0ULL);
+    });
+  }
+
+  for (int w = 0; w < kWriters; ++w) {
+    threads[static_cast<std::size_t>(w)].join();
+  }
+  done.store(true, std::memory_order_release);
+  for (int r = 0; r < kReaders; ++r) {
+    threads[static_cast<std::size_t>(kWriters + r)].join();
+  }
+
+  atomic_cell.store(nullptr);
+  (void)keepalive_cell.reset(portable::SharedPtr<TrackedBase>{});
+  hot_shared.reset();
+  EXPECT_EQ(TrackedBase::live.load(), 0);
 }
 
 }  // namespace

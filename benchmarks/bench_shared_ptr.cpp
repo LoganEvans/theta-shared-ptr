@@ -17,6 +17,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <theta/arch.hpp>
+#include <theta/portable/shared_ptr.hpp>
 #include <theta/shared_ptr.hpp>
 #include <thread>
 #include <vector>
@@ -77,6 +78,14 @@ void BM_01b_CreateDestroy_ThetaSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_01b_CreateDestroy_ThetaSharedPtr)->Apply(apply_thread_sweep);
 
+void BM_01c_CreateDestroy_PortableSharedPtr(benchmark::State& state) {
+  for (auto _ : state) {
+    auto p = theta::portable::make_shared<std::uint64_t>(42ULL);
+    benchmark::DoNotOptimize(p);
+  }
+}
+BENCHMARK(BM_01c_CreateDestroy_PortableSharedPtr)->Apply(apply_thread_sweep);
+
 // ============================================================================
 // 02. Hot Sharing (`0 -> 1 -> 0` Single Temporary Copy Loop — Real-World
 //     `auto cfg = global_cfg;` Service Handle Pattern)
@@ -100,6 +109,16 @@ void BM_02b_HotShare0to1_ThetaSharedPtr(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_02b_HotShare0to1_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_02c_HotShare0to1_PortableSharedPtr(benchmark::State& state) {
+  static const auto* g_ptr = new theta::portable::SharedPtr<std::uint64_t>(
+      theta::portable::make_shared<std::uint64_t>(7ULL));
+  for (auto _ : state) {
+    theta::portable::SharedPtr<std::uint64_t> local = *g_ptr;
+    benchmark::DoNotOptimize(local);
+  }
+}
+BENCHMARK(BM_02c_HotShare0to1_PortableSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 03. Pinned Hot Sharing (`1 -> 2 -> 1`)
@@ -127,6 +146,18 @@ void BM_03b_HotSharePinned_ThetaSharedPtr(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_03b_HotSharePinned_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_03c_HotSharePinned_PortableSharedPtr(benchmark::State& state) {
+  static const auto* g_ptr = new theta::portable::SharedPtr<std::uint64_t>(
+      theta::portable::make_shared<std::uint64_t>(9ULL));
+  theta::portable::SharedPtr<std::uint64_t> pinned = *g_ptr;
+  benchmark::DoNotOptimize(pinned);
+  for (auto _ : state) {
+    theta::portable::SharedPtr<std::uint64_t> local = *g_ptr;
+    benchmark::DoNotOptimize(local);
+  }
+}
+BENCHMARK(BM_03c_HotSharePinned_PortableSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 04. Cross-Thread Producer -> Consumer Handoff (Batched Ring Slots)
@@ -186,6 +217,14 @@ void BM_04b_CrossThreadProdCons_ThetaSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_04b_CrossThreadProdCons_ThetaSharedPtr)->Apply(apply_pair_sweep);
 
+void BM_04c_CrossThreadProdCons_PortableSharedPtr(benchmark::State& state) {
+  static const auto* g_ptr = new theta::portable::SharedPtr<std::uint64_t>(
+      theta::portable::make_shared<std::uint64_t>(11ULL));
+  run_prod_cons_bench(state, *g_ptr);
+}
+BENCHMARK(BM_04c_CrossThreadProdCons_PortableSharedPtr)
+    ->Apply(apply_pair_sweep);
+
 // ============================================================================
 // 05. Read-Mostly Config Snapshot (`KeepAlive::get()` — 99.99% Readers,
 //     Periodic Writer Reload Every 16,384 Ops on Thread 0)
@@ -242,6 +281,23 @@ void BM_05b_KeepAliveSnapshot_ThetaKeepAlive(benchmark::State& state) {
 }
 BENCHMARK(BM_05b_KeepAliveSnapshot_ThetaKeepAlive)->Apply(apply_thread_sweep);
 
+void BM_05c_KeepAliveSnapshot_PortableKeepAlive(benchmark::State& state) {
+  static auto* g_ka = new theta::portable::KeepAlive<std::uint64_t>(
+      theta::portable::make_shared<std::uint64_t>(1ULL));
+  std::uint64_t iter = 0;
+  for (auto _ : state) {
+    if (state.thread_index() == 0 && ((++iter & 16383ULL) == 0ULL))
+        [[unlikely]] {
+      (void)g_ka->reset(theta::portable::make_shared<std::uint64_t>(iter));
+    } else {
+      auto snap = g_ka->get();
+      benchmark::DoNotOptimize(*snap);
+    }
+  }
+}
+BENCHMARK(BM_05c_KeepAliveSnapshot_PortableKeepAlive)
+    ->Apply(apply_thread_sweep);
+
 // ============================================================================
 // 06. 2,048-Object Working-Set Table (Cache Footprint & Striped Page Packing)
 // ============================================================================
@@ -282,6 +338,25 @@ void BM_06b_Table2K_ThetaSharedPtr(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_06b_Table2K_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_06c_Table2K_PortableSharedPtr(benchmark::State& state) {
+  static const auto* g_tbl = []() {
+    auto* v =
+        new std::array<theta::portable::SharedPtr<std::uint64_t>, kTableSize>();
+    for (std::size_t i = 0; i < kTableSize; ++i) {
+      (*v)[i] = theta::portable::make_shared<std::uint64_t>(i);
+    }
+    return v;
+  }();
+  std::uint64_t idx =
+      static_cast<std::uint64_t>(state.thread_index()) * 2654435761ULL;
+  for (auto _ : state) {
+    idx = (idx + 17ULL) & (kTableSize - 1U);
+    auto cp = (*g_tbl)[idx];
+    benchmark::DoNotOptimize(cp);
+  }
+}
+BENCHMARK(BM_06c_Table2K_PortableSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 07. Ephemeral Cross-Thread Create + 1-Copy + Immediate Destroy (Max Rate)
@@ -344,6 +419,16 @@ void BM_07b_EphemeralCrossCpu_ThetaSharedPtr(benchmark::State& state) {
       /*work_spins=*/0U);
 }
 BENCHMARK(BM_07b_EphemeralCrossCpu_ThetaSharedPtr)->Apply(apply_pair_sweep);
+
+void BM_07c_EphemeralCrossCpu_PortableSharedPtr(benchmark::State& state) {
+  run_ephemeral_cross_cpu_bench<theta::portable::SharedPtr<std::uint64_t>>(
+      state,
+      [](std::uint64_t v) {
+        return theta::portable::make_shared<std::uint64_t>(v);
+      },
+      /*work_spins=*/0U);
+}
+BENCHMARK(BM_07c_EphemeralCrossCpu_PortableSharedPtr)->Apply(apply_pair_sweep);
 
 // ============================================================================
 // 08. Mixed Workload: 98.4% Hot Shared-Cache Reads + 1.6% Ephemeral Cross-CPU
@@ -435,6 +520,15 @@ void BM_08b_MixedHotAndEphemeral_ThetaSharedPtr(benchmark::State& state) {
 }
 BENCHMARK(BM_08b_MixedHotAndEphemeral_ThetaSharedPtr)->Apply(apply_pair_sweep);
 
+void BM_08c_MixedHotAndEphemeral_PortableSharedPtr(benchmark::State& state) {
+  run_mixed_hot_and_ephemeral_bench<theta::portable::SharedPtr<std::uint64_t>>(
+      state, [](std::uint64_t v) {
+        return theta::portable::make_shared<std::uint64_t>(v);
+      });
+}
+BENCHMARK(BM_08c_MixedHotAndEphemeral_PortableSharedPtr)
+    ->Apply(apply_pair_sweep);
+
 // ============================================================================
 // 09. Hot Concurrent `std::atomic<shared_ptr<T>>::load()` (Pure Read Scaling)
 // ============================================================================
@@ -457,6 +551,17 @@ void BM_09b_AtomicLoadHot_ThetaSharedPtr(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_09b_AtomicLoadHot_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_09c_AtomicLoadHot_PortableSharedPtr(benchmark::State& state) {
+  static auto* g_cell =
+      new std::atomic<theta::portable::SharedPtr<std::uint64_t>>(
+          theta::portable::make_shared<std::uint64_t>(77ULL));
+  for (auto _ : state) {
+    auto snap = g_cell->load(std::memory_order_acquire);
+    benchmark::DoNotOptimize(*snap);
+  }
+}
+BENCHMARK(BM_09c_AtomicLoadHot_PortableSharedPtr)->Apply(apply_thread_sweep);
 
 // ============================================================================
 // 10. `std::atomic<shared_ptr<T>>` Live Snapshot Reload (16,383 Reads : 1 Swap)
@@ -497,6 +602,25 @@ void BM_10b_AtomicSnapshotReload_ThetaSharedPtr(benchmark::State& state) {
 BENCHMARK(BM_10b_AtomicSnapshotReload_ThetaSharedPtr)
     ->Apply(apply_thread_sweep);
 
+void BM_10c_AtomicSnapshotReload_PortableSharedPtr(benchmark::State& state) {
+  static auto* g_cell =
+      new std::atomic<theta::portable::SharedPtr<std::uint64_t>>(
+          theta::portable::make_shared<std::uint64_t>(1ULL));
+  std::uint64_t iter = 0;
+  for (auto _ : state) {
+    if (state.thread_index() == 0 && ((++iter & 16383ULL) == 0ULL))
+        [[unlikely]] {
+      g_cell->store(theta::portable::make_shared<std::uint64_t>(iter),
+                    std::memory_order_release);
+    } else {
+      auto snap = g_cell->load(std::memory_order_acquire);
+      benchmark::DoNotOptimize(*snap);
+    }
+  }
+}
+BENCHMARK(BM_10c_AtomicSnapshotReload_PortableSharedPtr)
+    ->Apply(apply_thread_sweep);
+
 // ============================================================================
 // 11. Contended Write-Heavy `compare_exchange_weak` Churn (100% CAS Mutations)
 //     Verifies adaptive `atomic_pin_reads` warmup prevents `SYS_membarrier`
@@ -535,6 +659,24 @@ void BM_11b_AtomicCasChurn_ThetaSharedPtr(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_11b_AtomicCasChurn_ThetaSharedPtr)->Apply(apply_thread_sweep);
+
+void BM_11c_AtomicCasChurn_PortableSharedPtr(benchmark::State& state) {
+  static auto* g_cell =
+      new std::atomic<theta::portable::SharedPtr<std::uint64_t>>(
+          theta::portable::make_shared<std::uint64_t>(0ULL));
+  for (auto _ : state) {
+    auto cur = g_cell->load(std::memory_order_acquire);
+    for (;;) {
+      auto next = theta::portable::make_shared<std::uint64_t>(*cur + 1ULL);
+      if (g_cell->compare_exchange_weak(cur, std::move(next),
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        break;
+      }
+    }
+  }
+}
+BENCHMARK(BM_11c_AtomicCasChurn_PortableSharedPtr)->Apply(apply_thread_sweep);
 
 }  // namespace
 

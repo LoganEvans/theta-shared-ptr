@@ -37,7 +37,8 @@ else()
   add_compile_options(-O3 -fzero-call-used-regs=skip)
 endif()
 
-add_library(theta-shared-ptr STATIC src/shared_ptr.cpp)
+add_library(theta-shared-ptr STATIC src/shared_ptr.cpp
+                                    src/portable_shared_ptr.cpp)
 add_library(theta::theta-shared-ptr ALIAS theta-shared-ptr)
 add_library(theta::shared-ptr ALIAS theta-shared-ptr)
 set_target_properties(theta-shared-ptr PROPERTIES POSITION_INDEPENDENT_CODE ON)
